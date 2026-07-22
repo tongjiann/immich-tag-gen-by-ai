@@ -11,9 +11,9 @@
     </parent>
 
     <groupId>com.xiwang</groupId>
-    <artifactId>photo-tag-autogen</artifactId>
+    <artifactId>immich-tag-gen-by-ai</artifactId>
     <version>0.1.0-SNAPSHOT</version>
-    <name>photo-tag-autogen</name>
+    <name>immich-tag-gen-by-ai</name>
     <description>使用 Qwen2.5-VL 为 Immich 图片生成中文描述和多级标签</description>
 
     <properties>

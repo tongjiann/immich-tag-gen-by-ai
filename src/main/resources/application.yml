@@ -2,7 +2,7 @@ spring:
   main:
     web-application-type: none
   application:
-    name: photo-tag-autogen
+    name: immich-tag-gen-by-ai
   config:
     import: "optional:file:.env[.properties]"
 immich:
@@ -40,4 +40,4 @@ processing:
   model-release-interval: ${PROCESSING_MODEL_RELEASE_INTERVAL:50}
 logging:
   level:
-    com.xiwang.phototagautogen: debug
+    com.xiwang.phototagautogen: info

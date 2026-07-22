@@ -1,4 +1,4 @@
-# photo-tag-autogen
+# immich-tag-gen-by-ai
 
 通过本地 Ollama 或 OpenAI 兼容的视觉模型接口，遍历 Immich API Key 所属用户的图片，为图片生成简体中文描述和受控多级标签。
 
@@ -94,13 +94,13 @@ set +a
 正常全量运行：
 
 ```bash
-java -jar target/photo-tag-autogen-0.1.0-SNAPSHOT.jar
+java -jar target/immich-tag-gen-by-ai-0.1.0-SNAPSHOT.jar
 ```
 
 首次建议先对单张图片执行 dry-run：
 
 ```bash
-java -jar target/photo-tag-autogen-0.1.0-SNAPSHOT.jar \
+java -jar target/immich-tag-gen-by-ai-0.1.0-SNAPSHOT.jar \
   --processing.asset-id=替换为Immich图片UUID \
   --processing.dry-run=true
 ```
@@ -108,7 +108,7 @@ java -jar target/photo-tag-autogen-0.1.0-SNAPSHOT.jar \
 兼容旧脚本的 `force` 参数：
 
 ```bash
-java -jar target/photo-tag-autogen-0.1.0-SNAPSHOT.jar \
+java -jar target/immich-tag-gen-by-ai-0.1.0-SNAPSHOT.jar \
   --processing.force=true
 ```
 
