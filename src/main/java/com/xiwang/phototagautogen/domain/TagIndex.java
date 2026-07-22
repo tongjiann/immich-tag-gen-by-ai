@@ -32,6 +32,10 @@ public final class TagIndex {
 
     public synchronized List<ImmichTag> all() { return new ArrayList<>(byPath.values()); }
 
+    public synchronized List<String> getFullPathTags() {
+        return byPath.keySet().stream().toList();
+    }
+
     private String buildPath(UUID id, Collection<ImmichTag> allTags) {
         Map<UUID, ImmichTag> byId = new HashMap<>();
         allTags.forEach(tag -> byId.put(tag.id(), tag));

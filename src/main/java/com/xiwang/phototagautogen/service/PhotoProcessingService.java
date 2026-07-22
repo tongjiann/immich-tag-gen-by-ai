@@ -5,16 +5,7 @@ import com.xiwang.phototagautogen.client.RemoteCallException;
 import com.xiwang.phototagautogen.client.VisionModelClient;
 import com.xiwang.phototagautogen.config.ImmichProperties;
 import com.xiwang.phototagautogen.config.ProcessingProperties;
-import com.xiwang.phototagautogen.domain.AssetDetail;
-import com.xiwang.phototagautogen.domain.AssetPage;
-import com.xiwang.phototagautogen.domain.GeneratedTag;
-import com.xiwang.phototagautogen.domain.ImageAnalysis;
-import com.xiwang.phototagautogen.domain.ImmichAsset;
-import com.xiwang.phototagautogen.domain.ProcessingState;
-import com.xiwang.phototagautogen.domain.ProcessingSummary;
-import com.xiwang.phototagautogen.domain.TagIndex;
-import com.xiwang.phototagautogen.domain.TagPath;
-import com.xiwang.phototagautogen.domain.Taxonomy;
+import com.xiwang.phototagautogen.domain.*;
 import com.xiwang.phototagautogen.state.JsonlStateStore;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -68,6 +59,7 @@ public class PhotoProcessingService {
         log.info("正在加载 Immich 标签索引");
         TagIndex tagIndex = immichClient.listTags();
         log.info("Immich 标签索引加载完成");
+        log.info("现有索引，{}", String.join("，", tagIndex.getFullPathTags()));
 
         ProcessingSummary summary = new ProcessingSummary();
         if (assetId != null) {
@@ -99,12 +91,6 @@ public class PhotoProcessingService {
                         summary.skipped();
                         skippedOnPage++;
                         log.info("非图片资产，跳过处理 assetId={}, type={}", asset.id(), asset.type());
-                        continue;
-                    }
-                    if (!force && canSkip(asset, taxonomy)) {
-                        summary.skipped();
-                        skippedOnPage++;
-                        log.debug("图片状态未变化，跳过模型调用 assetId={}", asset.id());
                         continue;
                     }
                     pendingAssets.add(asset);
@@ -140,7 +126,7 @@ public class PhotoProcessingService {
                 log.info("图片已存在标签，跳过模型调用 assetId={}, tagCount={}", asset.id(), detail.tags().size());
                 return;
             }
-            processOne(asset, detail, taxonomy, tagIndex, dryRun, summary);
+            processOne(asset, taxonomy, tagIndex, dryRun, summary);
             log.info("图片处理流程结束 assetId={}, elapsedMs={}", asset.id(), elapsedMillis(assetStartedAt));
         } catch (Exception e) {
             summary.failed();
@@ -151,7 +137,7 @@ public class PhotoProcessingService {
         }
     }
 
-    private void processOne(ImmichAsset asset, AssetDetail detail, Taxonomy taxonomy, TagIndex tagIndex,
+    private void processOne(ImmichAsset asset, Taxonomy taxonomy, TagIndex tagIndex,
                             boolean dryRun, ProcessingSummary summary) {
         long previewStartedAt = System.nanoTime();
         log.info("正在下载图片预览图 assetId={}", asset.id());
@@ -171,17 +157,27 @@ public class PhotoProcessingService {
         }
 
         log.info("正在增量写回 Immich assetId={}", asset.id());
-        boolean descriptionUpdated = detail.description() == null || detail.description().isBlank();
+        AssetDetail latestDetail = immichClient.getAsset(asset.id());
+        if (!latestDetail.tags().isEmpty()) {
+            summary.skipped();
+            log.info("写回前检测到图片已存在标签，跳过写回 assetId={}, tagCount={}, tags={}", asset.id(),
+                    latestDetail.tags().size(), displayTagPaths(latestDetail.tags(), tagIndex));
+            return;
+        }
+
+        boolean descriptionUpdated = latestDetail.description() == null || latestDetail.description().isBlank();
         if (descriptionUpdated) {
             immichClient.updateDescription(asset.id(), normalized.description());
             summary.descriptionUpdated();
         }
 
-        Set<String> existingPaths = existingTagPaths(detail.tags(), tagIndex);
+        Set<String> existingPaths = existingTagPaths(latestDetail.tags(), tagIndex);
         Set<UUID> newTagIds = new HashSet<>();
+        List<String> newTagPaths = new ArrayList<>();
         for (GeneratedTag generatedTag : normalized.tags()) {
             TagPath path = generatedTag.tagPath();
-            if (existingPaths.contains(path.toString())) {
+            String pathText = path.toString();
+            if (existingPaths.contains(pathText)) {
                 continue;
             }
             UUID leafTagId;
@@ -189,17 +185,21 @@ public class PhotoProcessingService {
                 leafTagId = immichClient.ensureTagPath(path, tagIndex);
             }
             newTagIds.add(leafTagId);
-            existingPaths.add(path.toString());
+            newTagPaths.add(pathText);
+            existingPaths.add(pathText);
         }
         if (!newTagIds.isEmpty()) {
             immichClient.attachTags(asset.id(), newTagIds);
             summary.tagsAdded(newTagIds.size());
         }
 
-        stateStore.appendSuccess(asset.id(), fileModifiedAt(asset, detail), visionModelClient.modelName(),
+        stateStore.appendSuccess(asset.id(), fileModifiedAt(asset, latestDetail), visionModelClient.modelName(),
                 properties.getPromptVersion(), taxonomy.version());
-        log.info("Immich 写回完成 assetId={}, descriptionUpdated={}, newTags={}", asset.id(),
-                descriptionUpdated, newTagIds.size());
+        if (newTagPaths.stream().anyMatch(e -> !e.startsWith("风光") && !e.startsWith("人像"))) {
+            log.info("asset id:{}", asset.id());
+        }
+        log.info("Immich 写回完成 assetId={}, descriptionUpdated={}, newTagCount={}, newTags={}", asset.id(),
+                descriptionUpdated, newTagIds.size(), newTagPaths);
     }
 
     private ImageAnalysis analyzeWithProgress(UUID assetId, byte[] preview, Taxonomy taxonomy) {
@@ -246,17 +246,12 @@ public class PhotoProcessingService {
             throw new IllegalArgumentException("模型描述为空或长度超过限制");
         }
 
+        List<GeneratedTag> tags = analysis.tags();
+        Set<String> specificSiblingParentPaths = specificSiblingParentPaths(tags, taxonomy);
         Set<String> acceptedPaths = new HashSet<>();
         List<GeneratedTag> acceptedTags = new ArrayList<>();
         List<String> filteredTags = new ArrayList<>();
-        for (GeneratedTag tag : analysis.tags()) {
-            if (tag.confidence() == null
-                    || tag.confidence().compareTo(properties.getConfidenceThreshold()) < 0) {
-                filteredTags.add(formatFilteredTag(tag, "置信度低于阈值 "
-                        + properties.getConfidenceThreshold().toPlainString()));
-                continue;
-            }
-
+        for (GeneratedTag tag : tags) {
             TagPath path;
             try {
                 path = tag.tagPath();
@@ -264,8 +259,26 @@ public class PhotoProcessingService {
                 filteredTags.add(formatFilteredTag(tag, "路径格式无效: " + failureReason(e)));
                 continue;
             }
+            if (!tag.hasMatchingParentTag()) {
+                filteredTags.add(formatFilteredTag(tag, "父级标签与标签路径不一致"));
+                continue;
+            }
+            if (!taxonomy.isAllowedRoot(path.root())) {
+                filteredTags.add(formatFilteredTag(tag, "一级分类不在预设范围中"));
+                continue;
+            }
             if (!taxonomy.isAllowed(path)) {
                 filteredTags.add(formatFilteredTag(tag, "不在受控词表中"));
+                continue;
+            }
+            if (tag.confidence() == null) {
+                filteredTags.add(formatFilteredTag(tag, "置信度为空"));
+                continue;
+            }
+            if (isBelowConfidenceThreshold(tag)
+                    && !isFallbackOtherTag(path, specificSiblingParentPaths)) {
+                filteredTags.add(formatFilteredTag(tag, "置信度低于阈值 "
+                        + properties.getConfidenceThreshold().toPlainString()));
                 continue;
             }
             if (!acceptedPaths.add(path.key())) {
@@ -291,6 +304,34 @@ public class PhotoProcessingService {
         return new ImageAnalysis(analysis.description().trim(), acceptedTags, analysis.portraitSubject());
     }
 
+    private Set<String> specificSiblingParentPaths(List<GeneratedTag> tags, Taxonomy taxonomy) {
+        Set<String> parentPaths = new HashSet<>();
+        for (GeneratedTag tag : tags) {
+            try {
+                TagPath path = tag.tagPath();
+                if (taxonomy.isAllowed(path) && !"其它".equals(path.segments().getLast())) {
+                    parentPaths.add(parentPathKey(path));
+                }
+            } catch (IllegalArgumentException ignored) {
+                // 非法路径由主归一化流程记录具体过滤原因。
+            }
+        }
+        return parentPaths;
+    }
+
+    private boolean isBelowConfidenceThreshold(GeneratedTag tag) {
+        return tag.confidence().compareTo(properties.getConfidenceThreshold()) < 0;
+    }
+
+    private boolean isFallbackOtherTag(TagPath path, Set<String> specificSiblingParentPaths) {
+        return "其它".equals(path.segments().getLast())
+                && !specificSiblingParentPaths.contains(parentPathKey(path));
+    }
+
+    private String parentPathKey(TagPath path) {
+        return String.join("/", path.segments().subList(0, path.segments().size() - 1));
+    }
+
     private void validatePortraitTags(boolean portraitSubject, List<GeneratedTag> tags, Taxonomy taxonomy) {
         List<TagPath> paths = tags.stream().map(GeneratedTag::tagPath).toList();
         boolean hasPortraitTag = paths.stream().anyMatch(path -> "人像".equals(path.root()));
@@ -303,15 +344,6 @@ public class PhotoProcessingService {
         taxonomy.validateRequiredBranches("人像", paths);
     }
 
-    private boolean canSkip(ImmichAsset asset, Taxonomy taxonomy) {
-        ProcessingState state = stateStore.find(asset.id());
-        return state != null && "SUCCESS".equals(state.status())
-                && equalsNullable(state.fileModifiedAt(), fileModifiedAt(asset, null))
-                && visionModelClient.modelName().equals(state.model())
-                && properties.getPromptVersion().equals(state.promptVersion())
-                && taxonomy.version() == state.taxonomyVersion();
-    }
-
     private Set<String> existingTagPaths(Collection<com.xiwang.phototagautogen.domain.ImmichTag> tags,
                                          TagIndex tagIndex) {
         Set<String> paths = new HashSet<>();
@@ -322,6 +354,17 @@ public class PhotoProcessingService {
             }
         }
         return paths;
+    }
+
+    private List<String> displayTagPaths(Collection<com.xiwang.phototagautogen.domain.ImmichTag> tags,
+                                         TagIndex tagIndex) {
+        return tags.stream()
+                .map(tag -> {
+                    String path = tagIndex.pathOf(tag.id());
+                    return path == null ? tag.name() : path;
+                })
+                .sorted()
+                .toList();
     }
 
     private void recordFailure(ImmichAsset asset, Taxonomy taxonomy, String errorCode, boolean dryRun) {
@@ -345,10 +388,6 @@ public class PhotoProcessingService {
         Instant instant = asset.fileModifiedAt() != null ? asset.fileModifiedAt()
                 : detail == null ? null : detail.fileModifiedAt();
         return instant == null ? "" : instant.toString();
-    }
-
-    private boolean equalsNullable(String left, String right) {
-        return left == null ? right == null : left.equals(right);
     }
 
     private String assetPageUrl(UUID assetId) {

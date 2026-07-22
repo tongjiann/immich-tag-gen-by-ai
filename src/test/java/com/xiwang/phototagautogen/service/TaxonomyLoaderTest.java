@@ -15,18 +15,22 @@ class TaxonomyLoaderTest {
         Taxonomy taxonomy = new TaxonomyLoader().load();
 
         assertThat(taxonomy.version()).isEqualTo(3);
-        assertThat(taxonomy.categories().keySet()).containsExactly("人像", "场景", "天气", "季节", "主体", "颜色", "活动");
+        assertThat(taxonomy.categories().keySet()).containsExactly("人像", "风光");
+        assertThat(taxonomy.allowedRoots()).containsExactly("人像", "风光");
+        assertThat(taxonomy.isAllowedRoot("人像")).isTrue();
+        assertThat(taxonomy.isAllowedRoot("地点")).isFalse();
         assertThat(taxonomy.categories().get("人像")).hasSize(15);
         assertThat(taxonomy.requiredBranches("人像")).containsExactly(
-                "人脸角度", "姿态", "景别", "服饰类型", "主体颜色", "配饰", "场景", "拍摄风格");
+                "人脸角度", "姿态", "景别", "服饰类型", "主体颜色", "配饰", "场景");
         assertThat(taxonomy.recommendedBranches("人像")).containsExactly(
-                "发型", "环境元素", "光照", "时间/季节", "摄影类型", "构图方式", "画面风格");
+                "发型", "环境元素", "光照", "时间/季节", "摄影类型", "构图方式", "画面风格", "拍摄风格");
         assertThat(taxonomy.isAllowed(path("人像", "人脸角度", "正脸"))).isTrue();
         assertThat(taxonomy.isAllowed(path("人像", "配饰", "无配饰"))).isTrue();
         assertThat(taxonomy.isAllowed(path("人像", "场景", "其它"))).isTrue();
         assertThat(taxonomy.isAllowed(path("人像", "时间", "季节", "春"))).isTrue();
         assertThat(taxonomy.isAllowed(path("人物", "人数", "单人"))).isFalse();
-        assertThat(taxonomy.isAllowed(path("季节", "春"))).isTrue();
+        assertThat(taxonomy.isAllowed(path("风光", "季节", "春"))).isTrue();
+        assertThat(taxonomy.isAllowed(path("季节", "春"))).isFalse();
         assertThat(taxonomy.isAllowed(path("季节", "时节", "春"))).isFalse();
     }
 
@@ -39,7 +43,7 @@ class TaxonomyLoaderTest {
                 path("人像", "姿态", "站立"),
                 path("人像", "景别", "全景")));
 
-        assertThat(missing).containsExactly("服饰类型", "主体颜色", "配饰", "场景", "拍摄风格");
+        assertThat(missing).containsExactly("服饰类型", "主体颜色", "配饰", "场景");
     }
 
     @Test

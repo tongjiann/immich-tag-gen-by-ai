@@ -8,8 +8,8 @@
 - 支持 Ollama `/api/chat` 和 OpenAI 兼容 `/v1/chat/completions` 多模态接口，不把图片写入本地文件。
 - 仅为空白描述写入模型描述，不覆盖人工描述。
 - 仅添加 `taxonomy.yml` 中允许的多级标签，不删除或覆盖已有标签。
-- 使用 JSONL 保存最小化处理状态，支持断点续跑、失败重试和版本变更后重跑。
-- 支持全量执行、强制推理、dry-run 和单图片调试。
+- 使用 JSONL 保存最小化处理结果，用于成功/失败审计和问题排查；资产是否处理始终以 Immich 实时标签为准。
+- 支持全量执行、dry-run 和单图片调试，并保留 `force` 兼容参数。
 
 ## 环境要求
 
@@ -105,14 +105,14 @@ java -jar target/photo-tag-autogen-0.1.0-SNAPSHOT.jar \
   --processing.dry-run=true
 ```
 
-强制重新推理全部图片：
+兼容旧脚本的 `force` 参数：
 
 ```bash
 java -jar target/photo-tag-autogen-0.1.0-SNAPSHOT.jar \
   --processing.force=true
 ```
 
-强制模式仍然不会覆盖已有描述或删除已有标签。
+资产筛选始终以 Immich 实时标签为准：已有任意标签时跳过，实时标签为空时执行分析。`force` 不会绕过已有标签保护，也不会覆盖已有描述。
 
 ## 配置项
 
@@ -136,24 +136,25 @@ java -jar target/photo-tag-autogen-0.1.0-SNAPSHOT.jar \
 | `PROCESSING_MODEL_RELEASE_INTERVAL` | `50` | 每处理多少张候选图片后主动卸载模型，仅 Ollama 生效 |
 | `PROCESSING_CONNECT_TIMEOUT_SECONDS` | `5` | 连接超时 |
 | `PROCESSING_CONFIDENCE_THRESHOLD` | `0.65` | 标签置信度阈值 |
-| `PROCESSING_PROMPT_VERSION` | `v3` | 提示词协议版本 |
+| `PROCESSING_PROMPT_VERSION` | `v4` | 提示词协议版本 |
 | `PROCESSING_STATE_FILE` | `.data/processing-state.jsonl` | 本地状态文件 |
-| `PROCESSING_FORCE` | `false` | 是否忽略成功状态重新推理 |
+| `PROCESSING_FORCE` | `false` | 兼容旧脚本保留；不绕过实时标签判断 |
 | `PROCESSING_DRY_RUN` | `false` | 是否禁止写回和状态更新 |
 | `PROCESSING_ASSET_ID` | 空 | 指定单张图片 UUID |
 
 ## 处理规则
 
 1. 启动时验证 Immich、API Key 和所选视觉模型接口。
-2. 全量扫描图片，成功状态未变化或图片已存在任意标签时跳过模型调用。
+2. 全量扫描图片并读取实时资产详情；已有任意标签时跳过模型调用，标签为空时即使 JSONL 曾记录成功也重新分析。
 3. 下载 Immich 预览图并调用所选视觉模型；Ollama 模式每处理一批图片后主动卸载模型，避免长期运行时模型内存持续占用。
-4. 模型 JSON 必须返回布尔字段 `portraitSubject`。当主体是清晰可见的人时为 `true`；多人照片只描述最主要或最清晰的主体人物。
+4. 模型 JSON 必须返回布尔字段 `portraitSubject`；每个标签还必须返回与完整路径一致的父级路径字段 `parentTag`。当主体是清晰可见的人时为 `true`；多人照片只描述最主要或最清晰的主体人物。
 5. Java 按置信度、词表路径、去重和 15 标签上限依次过滤，再校验人像规则。`portraitSubject=true` 时，`人脸角度`、`姿态`、`景别`、`服饰类型`、`主体颜色`、`配饰`、`场景`、`拍摄风格` 8 类必须各保留至少一个 `人像/<分类>/<标签>`；否则整张图片处理失败，不写入描述或标签。
 6. 必选项无法可靠判断时使用该分类的 `其它`，不得猜测；确认没有明显配饰时使用 `人像/配饰/无配饰`，`其它` 表示存在未收录配饰或无法判断。`portraitSubject=false` 时不得返回任何 `人像/...` 标签。
-7. 描述只填空白值；标签只新增叶子标签，其他人工内容不变。已有任意标签的历史照片继续跳过，不迁移或删除旧 `人物/...` 标签。
-8. 单张失败不会终止全局任务，最后输出处理汇总。
+7. 对每条校验通过的标签路径，先复用完整路径；若不存在，则从最近的已存在父级开始逐层创建。父级节点只维护树结构，资产仅关联每条计划标签的叶子标签 ID。
+8. 写回前再次读取实时资产详情；若分析期间已新增任意标签，则放弃本次描述和标签写回。描述只填空白值，不迁移或删除旧 `人物/...` 标签。
+9. 单张失败不会终止全局任务，最后输出处理汇总。
 
-状态判断使用图片 `fileModifiedAt`、模型名称、提示词版本和词表版本。当前默认提示词版本为 `v3`，词表版本为 `3`。修改 `taxonomy.yml` 时应同步递增其中的 `version`。
+JSONL 状态记录图片 `fileModifiedAt`、模型名称、提示词版本、词表版本和处理结果，用于审计与排查，不作为无标签资产的跳过条件。当前默认提示词版本为 `v4`，词表版本为 `3`。修改 `taxonomy.yml` 时应同步递增其中的 `version`。
 
 ## 退出码
 

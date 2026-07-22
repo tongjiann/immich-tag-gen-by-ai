@@ -13,6 +13,7 @@ import com.xiwang.phototagautogen.domain.ImmichAsset;
 import com.xiwang.phototagautogen.domain.ImmichTag;
 import com.xiwang.phototagautogen.domain.ProcessingSummary;
 import com.xiwang.phototagautogen.domain.TagIndex;
+import com.xiwang.phototagautogen.domain.TagPath;
 import com.xiwang.phototagautogen.domain.Taxonomy;
 import com.xiwang.phototagautogen.state.JsonlStateStore;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -28,6 +29,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -45,13 +47,16 @@ class PhotoProcessingServiceTest {
     Path tempDir;
 
     @Test
-    void 已有人工描述时只补充标签且第二次运行跳过推理(CapturedOutput output) {
+    void 已有人工描述时只补充标签且后续实时已有标签时跳过推理(CapturedOutput output) {
         ImmichClient immichClient = mock(ImmichClient.class);
         VisionModelClient modelClient = mock(VisionModelClient.class);
         UUID assetId = UUID.randomUUID();
+        UUID tagId = UUID.randomUUID();
         Instant modifiedAt = Instant.parse("2026-07-21T00:00:00Z");
         ImmichAsset asset = new ImmichAsset(assetId, "IMAGE", false, false, modifiedAt);
-        AssetDetail detail = new AssetDetail(assetId, "IMAGE", "人工描述", modifiedAt, List.of());
+        AssetDetail untaggedDetail = new AssetDetail(assetId, "IMAGE", "人工描述", modifiedAt, List.of());
+        AssetDetail taggedDetail = new AssetDetail(assetId, "IMAGE", "人工描述", modifiedAt,
+                List.of(new ImmichTag(tagId, "春", null)));
         Taxonomy taxonomy = new Taxonomy(1, Map.of("季节", Map.of("", List.of("春"))));
         ProcessingProperties properties = properties(tempDir.resolve("state.jsonl"));
         JsonlStateStore stateStore = new JsonlStateStore(new ObjectMapper().findAndRegisterModules(), properties);
@@ -60,11 +65,11 @@ class PhotoProcessingServiceTest {
         when(modelClient.modelName()).thenReturn("qwen2.5vl:7b");
         when(immichClient.listTags()).thenReturn(new TagIndex());
         when(immichClient.listImages(1, 100)).thenReturn(new AssetPage(List.of(asset), false));
-        when(immichClient.getAsset(assetId)).thenReturn(detail);
+        when(immichClient.getAsset(assetId)).thenReturn(untaggedDetail, untaggedDetail, taggedDetail);
         when(immichClient.downloadPreview(assetId)).thenReturn(new byte[] {1, 2, 3});
         when(modelClient.analyze(any(), eq(taxonomy))).thenReturn(new ImageAnalysis(
                 "模型描述", List.of(new GeneratedTag(List.of("季节", "春"), new BigDecimal("0.95"))), false));
-        when(immichClient.ensureTagPath(any(), any())).thenReturn(UUID.randomUUID());
+        when(immichClient.ensureTagPath(any(), any())).thenReturn(tagId);
 
         PhotoProcessingService service = new PhotoProcessingService(immichClient, modelClient, taxonomyLoader,
                 stateStore, properties, immichProperties());
@@ -74,6 +79,7 @@ class PhotoProcessingServiceTest {
 
         assertThat(first.failures()).isZero();
         assertThat(second.failures()).isZero();
+        assertThat(second.skippedCount()).isEqualTo(1);
         verify(immichClient, never()).updateDescription(any(), any());
         verify(immichClient, times(1)).attachTags(eq(assetId), any());
         verify(modelClient, times(1)).analyze(any(), eq(taxonomy));
@@ -81,11 +87,52 @@ class PhotoProcessingServiceTest {
                 "开始处理图片，http://immich.test/photos/" + assetId,
                 "description=模型描述",
                 "tags=[季节/春(0.95)]",
-                "模型结果校验完成 assetId=" + assetId + "，接受的标签=[季节/春(0.95)]");
+                "模型结果校验完成 assetId=" + assetId + "，接受的标签=[季节/春(0.95)]",
+                "Immich 写回完成 assetId=" + assetId
+                        + ", descriptionUpdated=false, newTagCount=1, newTags=[季节/春]",
+                "图片已存在标签，跳过模型调用 assetId=" + assetId + ", tagCount=1");
     }
 
     @Test
-    void 图片已有标签时应在下载预览前跳过() {
+    void 成功状态存在但实时标签为空时仍应重新推理() {
+        ImmichClient immichClient = mock(ImmichClient.class);
+        VisionModelClient modelClient = mock(VisionModelClient.class);
+        UUID assetId = UUID.randomUUID();
+        UUID tagId = UUID.randomUUID();
+        Instant modifiedAt = Instant.parse("2026-07-21T00:00:00Z");
+        ImmichAsset asset = new ImmichAsset(assetId, "IMAGE", false, false, modifiedAt);
+        AssetDetail detail = new AssetDetail(assetId, "IMAGE", null, modifiedAt, List.of());
+        Taxonomy taxonomy = new Taxonomy(1, Map.of("季节", Map.of("", List.of("春"))));
+        ProcessingProperties properties = properties(tempDir.resolve("successful-but-untagged-state.jsonl"));
+        JsonlStateStore stateStore = new JsonlStateStore(new ObjectMapper().findAndRegisterModules(), properties);
+        stateStore.appendSuccess(assetId, modifiedAt.toString(), "qwen2.5vl:7b",
+                properties.getPromptVersion(), taxonomy.version());
+        TaxonomyLoader taxonomyLoader = mock(TaxonomyLoader.class);
+
+        when(taxonomyLoader.load()).thenReturn(taxonomy);
+        when(modelClient.modelName()).thenReturn("qwen2.5vl:7b");
+        when(immichClient.listTags()).thenReturn(new TagIndex());
+        when(immichClient.listImages(1, 100)).thenReturn(new AssetPage(List.of(asset), false));
+        when(immichClient.getAsset(assetId)).thenReturn(detail);
+        when(immichClient.downloadPreview(assetId)).thenReturn(new byte[] {1, 2, 3});
+        when(modelClient.analyze(any(), eq(taxonomy))).thenReturn(new ImageAnalysis(
+                "重新生成的描述", List.of(
+                new GeneratedTag(List.of("季节", "春"), new BigDecimal("0.95"))), false));
+        when(immichClient.ensureTagPath(any(), any())).thenReturn(tagId);
+
+        PhotoProcessingService service = new PhotoProcessingService(immichClient, modelClient, taxonomyLoader,
+                stateStore, properties, immichProperties());
+
+        ProcessingSummary summary = service.run(false, false, null);
+
+        assertThat(summary.analyzedCount()).isEqualTo(1);
+        assertThat(summary.failures()).isZero();
+        verify(modelClient).analyze(any(), eq(taxonomy));
+        verify(immichClient).attachTags(eq(assetId), any());
+    }
+
+    @Test
+    void 图片已有标签时即使强制模式也应在下载预览前跳过() {
         ImmichClient immichClient = mock(ImmichClient.class);
         VisionModelClient modelClient = mock(VisionModelClient.class);
         UUID assetId = UUID.randomUUID();
@@ -108,13 +155,140 @@ class PhotoProcessingServiceTest {
         PhotoProcessingService service = new PhotoProcessingService(immichClient, modelClient, taxonomyLoader,
                 stateStore, properties, immichProperties());
 
-        ProcessingSummary summary = service.run(false, false, null);
+        ProcessingSummary summary = service.run(true, false, null);
 
         assertThat(summary.skippedCount()).isEqualTo(1);
         assertThat(summary.analyzedCount()).isZero();
         assertThat(summary.failures()).isZero();
         verify(immichClient, never()).downloadPreview(any());
         verify(modelClient, never()).analyze(any(), any());
+    }
+
+    @Test
+    void 模型推理期间资产新增标签时应在写回前跳过(CapturedOutput output) {
+        ImmichClient immichClient = mock(ImmichClient.class);
+        VisionModelClient modelClient = mock(VisionModelClient.class);
+        UUID assetId = UUID.randomUUID();
+        UUID legacyTagId = UUID.randomUUID();
+        Instant modifiedAt = Instant.parse("2026-07-21T00:00:00Z");
+        ImmichAsset asset = new ImmichAsset(assetId, "IMAGE", false, false, modifiedAt);
+        AssetDetail initialDetail = new AssetDetail(assetId, "IMAGE", null, modifiedAt, List.of());
+        ImmichTag legacyTag = new ImmichTag(legacyTagId, "纪实", UUID.randomUUID());
+        AssetDetail latestDetail = new AssetDetail(assetId, "IMAGE", null, modifiedAt, List.of(legacyTag));
+        Taxonomy taxonomy = new Taxonomy(1, Map.of("风光", Map.of("天气", List.of("多云"))));
+        ProcessingProperties properties = properties(tempDir.resolve("tag-added-during-analysis-state.jsonl"));
+        JsonlStateStore stateStore = new JsonlStateStore(new ObjectMapper().findAndRegisterModules(), properties);
+        TaxonomyLoader taxonomyLoader = mock(TaxonomyLoader.class);
+        TagIndex tagIndex = new TagIndex();
+        tagIndex.add(legacyTag, "风格/表现/纪实");
+
+        when(taxonomyLoader.load()).thenReturn(taxonomy);
+        when(modelClient.modelName()).thenReturn("qwen2.5vl:7b");
+        when(immichClient.listTags()).thenReturn(tagIndex);
+        when(immichClient.listImages(1, 100)).thenReturn(new AssetPage(List.of(asset), false));
+        when(immichClient.getAsset(assetId)).thenReturn(initialDetail, latestDetail);
+        when(immichClient.downloadPreview(assetId)).thenReturn(new byte[] {1, 2, 3});
+        when(modelClient.analyze(any(), eq(taxonomy))).thenReturn(new ImageAnalysis(
+                "多云天气下的风光描述", List.of(
+                        new GeneratedTag(List.of("风光", "天气", "多云"), new BigDecimal("0.95"))), false));
+
+        PhotoProcessingService service = new PhotoProcessingService(immichClient, modelClient, taxonomyLoader,
+                stateStore, properties, immichProperties());
+
+        ProcessingSummary summary = service.run(false, false, null);
+
+        assertThat(summary.skippedCount()).isEqualTo(1);
+        assertThat(summary.analyzedCount()).isEqualTo(1);
+        assertThat(summary.failures()).isZero();
+        verify(immichClient, never()).updateDescription(any(), any());
+        verify(immichClient, never()).ensureTagPath(any(), any());
+        verify(immichClient, never()).attachTags(any(), any());
+        assertThat(output).contains(
+                "写回前检测到图片已存在标签，跳过写回 assetId=" + assetId,
+                "tagCount=1, tags=[风格/表现/纪实]");
+    }
+
+    @Test
+    void 多个计划标签应按路径去重并一次关联所有叶子标签Id() {
+        ImmichClient immichClient = mock(ImmichClient.class);
+        VisionModelClient modelClient = mock(VisionModelClient.class);
+        UUID assetId = UUID.randomUUID();
+        UUID weatherTagId = UUID.randomUUID();
+        UUID seasonTagId = UUID.randomUUID();
+        Instant modifiedAt = Instant.parse("2026-07-21T00:00:00Z");
+        ImmichAsset asset = new ImmichAsset(assetId, "IMAGE", false, false, modifiedAt);
+        AssetDetail detail = new AssetDetail(assetId, "IMAGE", null, modifiedAt, List.of());
+        Taxonomy taxonomy = new Taxonomy(1, Map.of("风光", Map.of(
+                "天气", List.of("多云"),
+                "季节", List.of("春"))));
+        ProcessingProperties properties = properties(tempDir.resolve("multiple-tag-ids-state.jsonl"));
+        JsonlStateStore stateStore = new JsonlStateStore(new ObjectMapper().findAndRegisterModules(), properties);
+        TaxonomyLoader taxonomyLoader = mock(TaxonomyLoader.class);
+        TagPath weatherPath = new TagPath(List.of("风光", "天气", "多云"));
+        TagPath seasonPath = new TagPath(List.of("风光", "季节", "春"));
+
+        when(taxonomyLoader.load()).thenReturn(taxonomy);
+        when(modelClient.modelName()).thenReturn("qwen2.5vl:7b");
+        when(immichClient.listTags()).thenReturn(new TagIndex());
+        when(immichClient.listImages(1, 100)).thenReturn(new AssetPage(List.of(asset), false));
+        when(immichClient.getAsset(assetId)).thenReturn(detail);
+        when(immichClient.downloadPreview(assetId)).thenReturn(new byte[] {1, 2, 3});
+        when(modelClient.analyze(any(), eq(taxonomy))).thenReturn(new ImageAnalysis(
+                "春季多云风光描述", List.of(
+                new GeneratedTag(weatherPath.segments(), new BigDecimal("0.95")),
+                new GeneratedTag(weatherPath.segments(), new BigDecimal("0.90")),
+                new GeneratedTag(seasonPath.segments(), new BigDecimal("0.95"))), false));
+        when(immichClient.ensureTagPath(eq(weatherPath), any())).thenReturn(weatherTagId);
+        when(immichClient.ensureTagPath(eq(seasonPath), any())).thenReturn(seasonTagId);
+
+        PhotoProcessingService service = new PhotoProcessingService(immichClient, modelClient, taxonomyLoader,
+                stateStore, properties, immichProperties());
+
+        ProcessingSummary summary = service.run(false, false, null);
+
+        assertThat(summary.tagsAddedCount()).isEqualTo(2);
+        assertThat(summary.failures()).isZero();
+        verify(immichClient).ensureTagPath(eq(weatherPath), any());
+        verify(immichClient).ensureTagPath(eq(seasonPath), any());
+        verify(immichClient).attachTags(eq(assetId), argThat(tagIds -> tagIds.size() == 2
+                && Set.copyOf(tagIds).equals(Set.of(weatherTagId, seasonTagId))));
+    }
+
+    @Test
+    void dryRun应完成分析但不创建或写回标签状态() {
+        ImmichClient immichClient = mock(ImmichClient.class);
+        VisionModelClient modelClient = mock(VisionModelClient.class);
+        UUID assetId = UUID.randomUUID();
+        Instant modifiedAt = Instant.parse("2026-07-21T00:00:00Z");
+        ImmichAsset asset = new ImmichAsset(assetId, "IMAGE", false, false, modifiedAt);
+        AssetDetail detail = new AssetDetail(assetId, "IMAGE", null, modifiedAt, List.of());
+        Taxonomy taxonomy = new Taxonomy(1, Map.of("季节", Map.of("", List.of("春"))));
+        ProcessingProperties properties = properties(tempDir.resolve("dry-run-state.jsonl"));
+        JsonlStateStore stateStore = new JsonlStateStore(new ObjectMapper().findAndRegisterModules(), properties);
+        TaxonomyLoader taxonomyLoader = mock(TaxonomyLoader.class);
+
+        when(taxonomyLoader.load()).thenReturn(taxonomy);
+        when(modelClient.modelName()).thenReturn("qwen2.5vl:7b");
+        when(immichClient.listTags()).thenReturn(new TagIndex());
+        when(immichClient.listImages(1, 100)).thenReturn(new AssetPage(List.of(asset), false));
+        when(immichClient.getAsset(assetId)).thenReturn(detail);
+        when(immichClient.downloadPreview(assetId)).thenReturn(new byte[] {1, 2, 3});
+        when(modelClient.analyze(any(), eq(taxonomy))).thenReturn(new ImageAnalysis(
+                "春季图片描述", List.of(
+                new GeneratedTag(List.of("季节", "春"), new BigDecimal("0.95"))), false));
+
+        PhotoProcessingService service = new PhotoProcessingService(immichClient, modelClient, taxonomyLoader,
+                stateStore, properties, immichProperties());
+
+        ProcessingSummary summary = service.run(false, true, null);
+
+        assertThat(summary.analyzedCount()).isEqualTo(1);
+        assertThat(summary.failures()).isZero();
+        assertThat(stateStore.find(assetId)).isNull();
+        verify(modelClient).analyze(any(), eq(taxonomy));
+        verify(immichClient, never()).updateDescription(any(), any());
+        verify(immichClient, never()).ensureTagPath(any(), any());
+        verify(immichClient, never()).attachTags(any(), any());
     }
 
     @Test
@@ -186,6 +360,40 @@ class PhotoProcessingServiceTest {
         verify(immichClient, never()).attachTags(any(), any());
     }
 
+
+    @Test
+    void 父级标签与标签路径不一致时应过滤标签() {
+        Scenario scenario = runSingleAnalysis(
+                new ImageAnalysis("父级标签错误的风景描述", List.of(
+                        new GeneratedTag(List.of("风光", "季节", "春"), "风光/天气",
+                                new BigDecimal("0.95"))), false),
+                "invalid-parent-tag-state.jsonl");
+
+        assertThat(scenario.summary().failures()).isZero();
+        assertThat(scenario.summary().analyzedCount()).isEqualTo(1);
+        verify(scenario.modelClient()).analyze(any(), any());
+        verify(scenario.immichClient()).updateDescription(scenario.assetId(), "父级标签错误的风景描述");
+        verify(scenario.immichClient(), never()).ensureTagPath(any(), any());
+        verify(scenario.immichClient(), never()).attachTags(any(), any());
+    }
+
+    @Test
+    void 非预设一级分类应过滤且合法分类正常写入() {
+        Scenario scenario = runSingleAnalysis(
+                new ImageAnalysis("包含合法和非预设一级分类的风景描述", List.of(
+                        new GeneratedTag(List.of("风光", "季节", "春"), new BigDecimal("0.95")),
+                        new GeneratedTag(List.of("地点", "公园"), new BigDecimal("0.99"))), false),
+                "unknown-root-state.jsonl");
+
+        assertThat(scenario.summary().failures()).isZero();
+        assertThat(scenario.summary().analyzedCount()).isEqualTo(1);
+        verify(scenario.modelClient()).analyze(any(), any());
+        verify(scenario.immichClient()).ensureTagPath(
+                eq(new TagPath(List.of("风光", "季节", "春"))), any());
+        verify(scenario.immichClient(), never()).ensureTagPath(
+                argThat(tagPath -> "地点".equals(tagPath.root())), any());
+        verify(scenario.immichClient()).attachTags(eq(scenario.assetId()), any());
+    }
 
     @Test
     void 配置两个并发线程时应同时执行两张图片推理() {
@@ -306,10 +514,10 @@ class PhotoProcessingServiceTest {
     @Test
     void 人像校验首次失败后重试成功时应正常写入(CapturedOutput output) {
         List<GeneratedTag> incompleteTags = completePortraitTags().stream()
-                .filter(tag -> !tag.path().get(1).equals("拍摄风格"))
+                .filter(tag -> !tag.path().get(1).equals("人脸角度"))
                 .toList();
         Scenario scenario = runSingleAnalyses(List.of(
-                        new ImageAnalysis("首次缺少拍摄风格", incompleteTags, true),
+                        new ImageAnalysis("首次缺少人脸角度", incompleteTags, true),
                         new ImageAnalysis("重试后的完整人像描述", completePortraitTags(), true)),
                 "portrait-retry-success-state.jsonl");
 
@@ -321,13 +529,13 @@ class PhotoProcessingServiceTest {
         assertThat(output).contains(
                 "模型结果校验失败，准备重新推理 assetId=" + scenario.assetId(),
                 "retry=1/3",
-                "reason=人像模型结果缺少必选分类: 拍摄风格");
+                "reason=人像模型结果缺少必选分类: 人脸角度");
     }
 
     @Test
     void 人像校验连续失败时应重试三次并输出具体原因(CapturedOutput output) {
         List<GeneratedTag> tags = completePortraitTags().stream()
-                .filter(tag -> !List.of("人脸角度", "拍摄风格").contains(tag.path().get(1)))
+                .filter(tag -> !tag.path().get(1).equals("人脸角度"))
                 .collect(Collectors.toCollection(ArrayList::new));
         tags.add(new GeneratedTag(List.of("人像", "人脸角 度", "正脸"), new BigDecimal("0.98")));
         Scenario scenario = runSingleAnalysis(
@@ -347,9 +555,45 @@ class PhotoProcessingServiceTest {
                 "retry=3/3",
                 "模型结果校验失败，重试机会已耗尽 assetId=" + scenario.assetId(),
                 "attempts=4, maxRetries=3",
-                "reason=人像模型结果缺少必选分类: 人脸角度、拍摄风格；已过滤标签: "
+                "reason=人像模型结果缺少必选分类: 人脸角度；已过滤标签: "
                         + "人像/人脸角 度/正脸（不在受控词表中）",
                 "处理图片失败 assetId=" + scenario.assetId() + ", errorCode=invalid-model-result, reason=");
+    }
+
+    @Test
+    void 低置信度其它为唯一同级标签时应作为兜底保留(CapturedOutput output) {
+        List<GeneratedTag> tags = new ArrayList<>(completePortraitTags());
+        tags.set(7, tag("拍摄风格", "其它", "0.40"));
+        Scenario scenario = runSingleAnalysis(
+                new ImageAnalysis("使用其它拍摄风格兜底的人像描述", tags, true),
+                "low-confidence-other-fallback-state.jsonl");
+
+        assertThat(scenario.summary().failures()).isZero();
+        assertThat(scenario.summary().analyzedCount()).isEqualTo(1);
+        verify(scenario.modelClient()).analyze(any(), any());
+        verify(scenario.immichClient()).ensureTagPath(
+                eq(new TagPath(List.of("人像", "拍摄风格", "其它"))), any());
+        verify(scenario.immichClient()).attachTags(eq(scenario.assetId()), any());
+        assertThat(output)
+                .contains("人像/拍摄风格/其它(0.40)")
+                .doesNotContain("人像/拍摄风格/其它（置信度低于阈值");
+    }
+
+    @Test
+    void 存在具体同级标签时低置信度其它仍应过滤(CapturedOutput output) {
+        List<GeneratedTag> tags = new ArrayList<>(completePortraitTags());
+        tags.add(tag("拍摄风格", "其它", "0.40"));
+        Scenario scenario = runSingleAnalysis(
+                new ImageAnalysis("包含明确及其它拍摄风格的人像描述", tags, true),
+                "low-confidence-other-with-sibling-state.jsonl");
+
+        assertThat(scenario.summary().failures()).isZero();
+        verify(scenario.modelClient()).analyze(any(), any());
+        verify(scenario.immichClient(), times(8)).ensureTagPath(any(), any());
+        verify(scenario.immichClient(), never()).ensureTagPath(
+                eq(new TagPath(List.of("人像", "拍摄风格", "其它"))), any());
+        assertThat(output).contains("接受的标签=[")
+                .doesNotContain("接受的标签=[人像/拍摄风格/其它(0.40)");
     }
 
     @Test
@@ -418,7 +662,7 @@ class PhotoProcessingServiceTest {
     void 非人像主题应正常写入通用标签() {
         Scenario scenario = runSingleAnalysis(
                 new ImageAnalysis("春季风景描述", List.of(
-                        new GeneratedTag(List.of("季节", "春"), new BigDecimal("0.95"))), false),
+                        new GeneratedTag(List.of("风光", "季节", "春"), new BigDecimal("0.95"))), false),
                 "non-portrait-state.jsonl");
 
         assertThat(scenario.summary().failures()).isZero();

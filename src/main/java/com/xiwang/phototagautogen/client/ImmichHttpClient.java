@@ -11,6 +11,7 @@ import com.xiwang.phototagautogen.domain.ImmichAsset;
 import com.xiwang.phototagautogen.domain.ImmichTag;
 import com.xiwang.phototagautogen.domain.TagIndex;
 import com.xiwang.phototagautogen.domain.TagPath;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.net.URI;
@@ -25,6 +26,7 @@ import java.util.List;
 import java.util.UUID;
 
 @Component
+@Slf4j
 public class ImmichHttpClient implements ImmichClient {
     private static final String API_KEY_HEADER = "x-api-key";
 
@@ -107,35 +109,43 @@ public class ImmichHttpClient implements ImmichClient {
 
     @Override
     public UUID ensureTagPath(TagPath path, TagIndex tagIndex) {
-        UUID parentId = null;
-        String currentPath = "";
-        for (String segment : path.segments()) {
-            currentPath = currentPath.isEmpty() ? segment : currentPath + "/" + segment;
-            ImmichTag existing = tagIndex.find(currentPath);
-            if (existing != null) {
-                parentId = existing.id();
-                continue;
-            }
-            ObjectNode body = objectMapper.createObjectNode().put("name", segment);
-            if (parentId != null) {
-                body.put("parentId", parentId.toString());
-            }
-            JsonNode created = sendJson(jsonRequest("POST", "/api/tags", body));
-            UUID createdId = parseUuid(textOrNull(created.get("id")));
-            if (createdId == null) {
-                TagIndex refreshed = listTags();
-                ImmichTag refreshedTag = refreshed.find(currentPath);
-                if (refreshedTag == null) {
-                    throw new RemoteCallException("Immich 创建标签后无法找到标签路径: " + currentPath, -1);
-                }
-                tagIndex.addAll(refreshed.all());
-                createdId = refreshedTag.id();
-            } else {
-                tagIndex.add(new ImmichTag(createdId, segment, parentId), currentPath);
-            }
-            parentId = createdId;
+        return ensureTag(path.segments(), tagIndex);
+    }
+
+    private UUID ensureTag(List<String> segments, TagIndex tagIndex) {
+        String currentPath = String.join("/", segments);
+        ImmichTag existing = tagIndex.find(currentPath);
+        if (existing != null) {
+            return existing.id();
         }
-        return parentId;
+
+        UUID parentId = null;
+        if (segments.size() > 1) {
+            List<String> parentSegments = segments.subList(0, segments.size() - 1);
+            String parentPath = String.join("/", parentSegments);
+            ImmichTag parent = tagIndex.find(parentPath);
+            parentId = parent == null ? ensureTag(parentSegments, tagIndex) : parent.id();
+        }
+
+        String name = segments.getLast();
+        ObjectNode body = objectMapper.createObjectNode().put("name", name);
+        if (parentId != null) {
+            body.put("parentId", parentId.toString());
+        }
+        log.info("请求创建标签：{}，完整标签：{}", name, currentPath);
+        JsonNode created = sendJson(jsonRequest("POST", "/api/tags", body));
+        UUID createdId = parseUuid(textOrNull(created.get("id")));
+        if (createdId == null) {
+            TagIndex refreshed = listTags();
+            ImmichTag refreshedTag = refreshed.find(currentPath);
+            if (refreshedTag == null) {
+                throw new RemoteCallException("Immich 创建标签后无法找到标签路径: " + currentPath, -1);
+            }
+            tagIndex.addAll(refreshed.all());
+            return refreshedTag.id();
+        }
+        tagIndex.add(new ImmichTag(createdId, name, parentId), currentPath);
+        return createdId;
     }
 
     @Override
@@ -181,6 +191,7 @@ public class ImmichHttpClient implements ImmichClient {
 
     private JsonNode sendJson(HttpRequest request) {
         try {
+            log.debug("{}请求地址:{}", request.method(), request.uri());
             HttpResponse<byte[]> response = httpExecutor.execute(request);
             if (response.body().length == 0) {
                 return objectMapper.createObjectNode();

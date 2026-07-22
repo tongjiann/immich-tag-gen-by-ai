@@ -59,7 +59,8 @@ class OllamaHttpClientTest {
         assertThat(analysis.description()).isEqualTo("测试图片描述");
         assertThat(analysis.portraitSubject()).isFalse();
         assertThat(analysis.tags()).hasSize(1);
-        assertThat(analysis.tags().getFirst().path()).containsExactly("季节", "春");
+        assertThat(analysis.tags().getFirst().path()).containsExactly("风光", "季节", "春");
+        assertThat(analysis.tags().getFirst().parentTag()).isEqualTo("风光/季节");
         assertThat(requestBody.get().path("options").path("num_ctx").asInt()).isEqualTo(CONTEXT_WINDOW);
         assertThat(requestBody.get().path("keep_alive").asText()).isEqualTo("2m");
         assertThat(requestBody.get().path("format").path("properties").path("portraitSubject").path("type").asText())
@@ -67,12 +68,14 @@ class OllamaHttpClientTest {
         assertThat(requestBody.get().path("format").path("required"))
                 .extracting(JsonNode::asText)
                 .contains("portraitSubject");
-        assertThat(requestBody.get().path("format").path("properties").path("tags").path("items")
-                .path("properties").path("path").path("enum"))
+        JsonNode tagSchema = requestBody.get().path("format").path("properties").path("tags").path("items");
+        assertThat(tagSchema.path("properties").path("path").path("enum"))
                 .extracting(JsonNode::asText)
-                .contains("人像/配饰/无配饰", "季节/春");
+                .contains("人像/配饰/无配饰", "风光/季节/春");
+        assertThat(tagSchema.path("properties").path("parentTag").path("type").asText()).isEqualTo("string");
+        assertThat(tagSchema.path("required")).extracting(JsonNode::asText).contains("parentTag");
         assertThat(requestBody.get().path("messages").get(1).path("content").asText())
-                .contains("portraitSubject=true", "人脸角度、姿态、景别、服饰类型、主体颜色、配饰、场景、拍摄风格",
+                .contains("portraitSubject=true", "人脸角度、姿态、景别、服饰类型、主体颜色、配饰、场景",
                         "多人照片只以最主要或最清晰的人物为准", "只描述主体人物", "人像/配饰/无配饰");
     }
 
@@ -87,7 +90,7 @@ class OllamaHttpClientTest {
     private void handleChat(HttpExchange exchange) throws IOException {
         requestBody.set(objectMapper.readTree(exchange.getRequestBody().readAllBytes()));
         byte[] response = ("{\"message\":{\"content\":\"{\\\"description\\\":\\\"测试图片描述\\\","
-                + "\\\"portraitSubject\\\":false,\\\"tags\\\":[{\\\"path\\\":\\\"季节/春\\\",\\\"confidence\\\":0.9}]}\"}}").getBytes(StandardCharsets.UTF_8);
+                + "\\\"portraitSubject\\\":false,\\\"tags\\\":[{\\\"path\\\":\\\"风光/季节/春\\\",\\\"parentTag\\\":\\\"风光/季节\\\",\\\"confidence\\\":0.9}]}\"}}").getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().add("Content-Type", "application/json");
         exchange.sendResponseHeaders(200, response.length);
         try (var output = exchange.getResponseBody()) {

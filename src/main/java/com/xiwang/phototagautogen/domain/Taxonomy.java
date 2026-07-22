@@ -38,6 +38,10 @@ public final class Taxonomy {
 
     public Map<String, Rule> rules() { return rules; }
 
+    public Set<String> allowedRoots() { return categories.keySet(); }
+
+    public boolean isAllowedRoot(String root) { return categories.containsKey(root); }
+
     public boolean isAllowed(TagPath path) { return allowedPaths.contains(path.toString()); }
 
     public List<String> allowedPathStrings() {

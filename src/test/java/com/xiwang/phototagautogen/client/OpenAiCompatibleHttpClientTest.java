@@ -53,7 +53,8 @@ class OpenAiCompatibleHttpClientTest {
         assertThat(analysis.description()).isEqualTo("测试图片描述");
         assertThat(analysis.portraitSubject()).isFalse();
         assertThat(analysis.tags()).hasSize(1);
-        assertThat(analysis.tags().getFirst().path()).containsExactly("季节", "春");
+        assertThat(analysis.tags().getFirst().path()).containsExactly("风光", "季节", "春");
+        assertThat(analysis.tags().getFirst().parentTag()).isEqualTo("风光/季节");
         assertThat(requestPath.get()).isEqualTo("/v1/chat/completions");
         assertThat(authorization.get()).isEqualTo("Bearer test-key");
         assertThat(requestBody.get().path("model").asText()).isEqualTo("vision-model");
@@ -69,9 +70,12 @@ class OpenAiCompatibleHttpClientTest {
                 .isTrue();
         assertThat(schema.path("properties").path("portraitSubject").path("type").asText()).isEqualTo("boolean");
         assertThat(schema.path("required")).extracting(JsonNode::asText).contains("portraitSubject");
-        assertThat(schema.path("properties").path("tags").path("items").path("properties").path("path").path("enum"))
+        JsonNode tagSchema = schema.path("properties").path("tags").path("items");
+        assertThat(tagSchema.path("properties").path("path").path("enum"))
                 .extracting(JsonNode::asText)
-                .contains("人像/配饰/无配饰", "季节/春");
+                .contains("人像/配饰/无配饰", "风光/季节/春");
+        assertThat(tagSchema.path("properties").path("parentTag").path("type").asText()).isEqualTo("string");
+        assertThat(tagSchema.path("required")).extracting(JsonNode::asText).contains("parentTag");
     }
 
     @Test
@@ -126,7 +130,8 @@ class OpenAiCompatibleHttpClientTest {
         analysis.put("description", "测试图片描述");
         analysis.put("portraitSubject", false);
         analysis.putArray("tags").addObject()
-                .put("path", "季节/春")
+                .put("path", "风光/季节/春")
+                .put("parentTag", "风光/季节")
                 .put("confidence", 0.9);
         ObjectNode response = objectMapper.createObjectNode();
         response.putArray("choices").addObject().putObject("message")
