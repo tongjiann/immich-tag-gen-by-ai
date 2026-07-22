@@ -1,0 +1,39 @@
+spring:
+  main:
+    web-application-type: none
+  application:
+    name: photo-tag-autogen
+  config:
+    import: "optional:file:.env[.properties]"
+immich:
+  base-url: ${IMMICH_BASE_URL}
+  api-key: ${IMMICH_API_KEY}
+
+vision:
+  provider: ${VISION_PROVIDER:ollama}
+
+ollama:
+  base-url: ${OLLAMA_BASE_URL:http://127.0.0.1:11434}
+  model: ${OLLAMA_MODEL:qwen2.5vl:7b}
+  context-window: ${OLLAMA_CONTEXT_WINDOW:8192}
+  keep-alive: ${OLLAMA_KEEP_ALIVE:5m}
+
+openai:
+  base-url: ${OPENAI_BASE_URL:https://api.openai.com/v1}
+  api-key: ${OPENAI_API_KEY:}
+  model: ${OPENAI_MODEL:}
+
+processing:
+  page-size: ${PROCESSING_PAGE_SIZE:100}
+  max-retries: ${PROCESSING_MAX_RETRIES:3}
+  concurrency: ${PROCESSING_CONCURRENCY:4}
+  state-file: ${PROCESSING_STATE_FILE:.data/processing-state.jsonl}
+  force: ${PROCESSING_FORCE:false}
+  dry-run: ${PROCESSING_DRY_RUN:false}
+  asset-id: ${PROCESSING_ASSET_ID:}
+  http-timeout-seconds: ${PROCESSING_HTTP_TIMEOUT_SECONDS:30}
+  model-timeout-seconds: ${PROCESSING_MODEL_TIMEOUT_SECONDS:300}
+  connect-timeout-seconds: ${PROCESSING_CONNECT_TIMEOUT_SECONDS:5}
+  confidence-threshold: ${PROCESSING_CONFIDENCE_THRESHOLD:0.65}
+  prompt-version: ${PROCESSING_PROMPT_VERSION:v3}
+  model-release-interval: ${PROCESSING_MODEL_RELEASE_INTERVAL:50}
