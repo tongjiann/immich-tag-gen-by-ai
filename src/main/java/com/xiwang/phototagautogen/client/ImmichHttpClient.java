@@ -2,6 +2,7 @@ package com.xiwang.phototagautogen.client;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.xiwang.phototagautogen.config.ImmichProperties;
 import com.xiwang.phototagautogen.config.ProcessingProperties;
@@ -29,6 +30,12 @@ import java.util.UUID;
 @Slf4j
 public class ImmichHttpClient implements ImmichClient {
     private static final String API_KEY_HEADER = "x-api-key";
+
+    private static final int TAG_ALREADY_EXISTS_STATUS = 400;
+
+    private static final String TAG_ALREADY_EXISTS_MESSAGE = "A tag with that name already exists";
+
+    private static final int TAG_CONFLICT_REFRESH_ATTEMPTS = 2;
 
     private final String baseUrl;
     private final String apiKey;
@@ -109,7 +116,9 @@ public class ImmichHttpClient implements ImmichClient {
 
     @Override
     public UUID ensureTagPath(TagPath path, TagIndex tagIndex) {
-        return ensureTag(path.segments(), tagIndex);
+        synchronized (tagIndex) {
+            return ensureTag(path.segments(), tagIndex);
+        }
     }
 
     private UUID ensureTag(List<String> segments, TagIndex tagIndex) {
@@ -133,7 +142,15 @@ public class ImmichHttpClient implements ImmichClient {
             body.put("parentId", parentId.toString());
         }
         log.info("请求创建标签：{}，完整标签：{}", name, currentPath);
-        JsonNode created = sendJson(jsonRequest("POST", "/api/tags", body));
+        JsonNode created;
+        try {
+            created = sendJson(jsonRequest("POST", "/api/tags", body));
+        } catch (RemoteCallException e) {
+            if (!isTagAlreadyExistsConflict(e)) {
+                throw e;
+            }
+            return resolveTagAfterConflict(currentPath, tagIndex, e);
+        }
         UUID createdId = parseUuid(textOrNull(created.get("id")));
         if (createdId == null) {
             TagIndex refreshed = listTags();
@@ -148,23 +165,40 @@ public class ImmichHttpClient implements ImmichClient {
         return createdId;
     }
 
-    @Override
-    public void attachTags(UUID assetId, Collection<UUID> tagIds) {
-        for (UUID tagId : tagIds) {
-            ObjectNode body = objectMapper.createObjectNode();
-            body.putArray("ids").add(assetId.toString());
-            try {
-                sendJson(jsonRequest("PUT", "/api/tags/" + tagId + "/assets", body));
-            } catch (RemoteCallException e) {
-                if (e.statusCode() != 404) {
-                    throw e;
-                }
-                ObjectNode fallbackBody = objectMapper.createObjectNode();
-                fallbackBody.putArray("assetIds").add(assetId.toString());
-                fallbackBody.putArray("tagIds").add(tagId.toString());
-                sendJson(jsonRequest("PUT", "/api/tags/assets", fallbackBody));
+    private UUID resolveTagAfterConflict(String currentPath, TagIndex tagIndex, RemoteCallException conflict) {
+        log.warn("创建标签发生名称冲突，刷新标签索引后复用已有标签 path={}, status={}",
+                currentPath, conflict.statusCode());
+        for (int attempt = 1; attempt <= TAG_CONFLICT_REFRESH_ATTEMPTS; attempt++) {
+            TagIndex refreshed = listTags();
+            tagIndex.addAll(refreshed.all());
+            ImmichTag existing = tagIndex.find(currentPath);
+            if (existing != null) {
+                log.info("已从刷新后的标签索引复用标签 path={}, tagId={}, refreshAttempt={}",
+                        currentPath, existing.id(), attempt);
+                return existing.id();
             }
         }
+        throw new RemoteCallException("Immich 标签创建发生名称冲突，但刷新后无法找到标签路径: " + currentPath,
+                conflict.statusCode(), conflict);
+    }
+
+    private boolean isTagAlreadyExistsConflict(RemoteCallException exception) {
+        return exception.statusCode() == TAG_ALREADY_EXISTS_STATUS
+                && exception.getMessage() != null
+                && exception.getMessage().contains(TAG_ALREADY_EXISTS_MESSAGE);
+    }
+
+    @Override
+    public void attachTags(UUID assetId, Collection<UUID> tagIds) {
+        if (tagIds == null || tagIds.isEmpty()) {
+            return;
+        }
+        ObjectNode objectNode = objectMapper.createObjectNode();
+        objectNode.putArray("assetIds")
+                .add(assetId.toString());
+        ArrayNode tagIdsNode = objectNode.putArray("tagIds");
+        tagIds.forEach(tagId -> tagIdsNode.add(tagId.toString()));
+        sendJson(jsonRequest("PUT", "/api/tags/assets", objectNode));
     }
 
     private HttpRequest get(String path) {

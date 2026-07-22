@@ -13,5 +13,10 @@ public class RemoteCallException extends RuntimeException {
         this.statusCode = -1;
     }
 
+    public RemoteCallException(String message, int statusCode, Throwable cause) {
+        super(message, cause);
+        this.statusCode = statusCode;
+    }
+
     public int statusCode() { return statusCode; }
 }
