@@ -39,5 +39,4 @@ processing:
   prompt-version: ${PROCESSING_PROMPT_VERSION:v4}
   model-release-interval: ${PROCESSING_MODEL_RELEASE_INTERVAL:50}
 logging:
-  level:
-    com.xiwang.phototagautogen: info
+  config: ./logback.xml
