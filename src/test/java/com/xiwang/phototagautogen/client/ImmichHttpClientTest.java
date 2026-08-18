@@ -34,12 +34,14 @@ class ImmichHttpClientTest {
     private final List<UUID> createdTagIds = new ArrayList<>();
     private final List<ImmichTag> listedTags = new ArrayList<>();
     private JsonNode attachedTagsRequest;
+    private final List<JsonNode> attachedSingleTagRequests = new ArrayList<>();
     private HttpServer server;
     private UUID createdTagId;
     private String conflictingTagName;
     private UUID conflictingTagId;
     private boolean exposeConflictingTag = true;
     private boolean conflictConsumed;
+    private boolean singleTagAssetsNotFound;
     private ImmichHttpClient client;
 
     @BeforeEach
@@ -89,9 +91,28 @@ class ImmichHttpClientTest {
         assertThat(requests).contains("GET /api/assets/" + assetId);
         assertThat(requests).contains("GET /api/tags");
         assertThat(requests).contains("POST /api/tags");
+        assertThat(requests).contains("PUT /api/tags/" + createdTagId + "/assets");
+        assertThat(requests).doesNotContain("PUT /api/tags/assets");
+        assertThat(attachedSingleTagRequests).hasSize(1);
+        assertThat(attachedSingleTagRequests.getFirst().path("assetIds").get(0).asText())
+                .isEqualTo(assetId.toString());
+        assertThat(attachedSingleTagRequests.getFirst().path("ids").get(0).asText())
+                .isEqualTo(assetId.toString());
+        assertThat(attachedSingleTagRequests.getFirst().has("tagIds")).isFalse();
+    }
+
+    @Test
+    void 单标签关联接口返回404时应回退到批量接口() {
+        UUID tagId = UUID.randomUUID();
+        singleTagAssetsNotFound = true;
+
+        client.attachTags(assetId, List.of(tagId));
+
+        assertThat(requests).contains("PUT /api/tags/" + tagId + "/assets");
         assertThat(requests).contains("PUT /api/tags/assets");
         assertThat(attachedTagsRequest.path("assetIds").get(0).asText()).isEqualTo(assetId.toString());
-        assertThat(attachedTagsRequest.path("tagIds").get(0).asText()).isEqualTo(createdTagId.toString());
+        assertThat(attachedTagsRequest.path("tagIds").get(0).asText()).isEqualTo(tagId.toString());
+        assertThat(attachedSingleTagRequests).isEmpty();
     }
 
     @Test
@@ -296,6 +317,16 @@ class ImmichHttpClientTest {
         } else if ("PUT".equals(method) && "/api/tags/assets".equals(path)) {
             attachedTagsRequest = objectMapper.readTree(exchange.getRequestBody().readAllBytes());
             response = "[]";
+        } else if ("PUT".equals(method) && path.startsWith("/api/tags/")
+                && path.endsWith("/assets")) {
+            JsonNode requestBody = objectMapper.readTree(exchange.getRequestBody().readAllBytes());
+            if (singleTagAssetsNotFound) {
+                status = 404;
+                response = "{\"message\":\"not found\"}";
+            } else {
+                attachedSingleTagRequests.add(requestBody);
+                response = "[]";
+            }
         } else {
             status = 404;
             response = "{\"message\":\"not found\"}";

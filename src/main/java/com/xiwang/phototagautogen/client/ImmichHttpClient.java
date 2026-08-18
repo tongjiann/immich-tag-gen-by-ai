@@ -33,6 +33,8 @@ public class ImmichHttpClient implements ImmichClient {
 
     private static final int TAG_ALREADY_EXISTS_STATUS = 400;
 
+    private static final int TAG_ASSETS_NOT_FOUND_STATUS = 404;
+
     private static final String TAG_ALREADY_EXISTS_MESSAGE = "A tag with that name already exists";
 
     private static final int TAG_CONFLICT_REFRESH_ATTEMPTS = 2;
@@ -193,12 +195,32 @@ public class ImmichHttpClient implements ImmichClient {
         if (tagIds == null || tagIds.isEmpty()) {
             return;
         }
-        ObjectNode objectNode = objectMapper.createObjectNode();
-        objectNode.putArray("assetIds")
-                .add(assetId.toString());
-        ArrayNode tagIdsNode = objectNode.putArray("tagIds");
-        tagIds.forEach(tagId -> tagIdsNode.add(tagId.toString()));
-        sendJson(jsonRequest("PUT", "/api/tags/assets", objectNode));
+        List<UUID> batchTagIds = new ArrayList<>();
+        for (UUID tagId : tagIds) {
+            ObjectNode body = objectMapper.createObjectNode();
+            // Immich v3 起单标签关联接口改用 ids 字段，旧版本使用 assetIds，同时携带以兼容
+            body.putArray("assetIds").add(assetId.toString());
+            body.putArray("ids").add(assetId.toString());
+            try {
+                sendJson(jsonRequest("PUT", "/api/tags/" + tagId + "/assets", body));
+            } catch (RemoteCallException e) {
+                if (e.statusCode() == TAG_ASSETS_NOT_FOUND_STATUS) {
+                    log.warn("单标签关联接口不可用，标签改用批量接口关联 tagId={}, status={}",
+                            tagId, e.statusCode());
+                    batchTagIds.add(tagId);
+                } else {
+                    throw e;
+                }
+            }
+        }
+        if (!batchTagIds.isEmpty()) {
+            ObjectNode objectNode = objectMapper.createObjectNode();
+            objectNode.putArray("assetIds")
+                    .add(assetId.toString());
+            ArrayNode tagIdsNode = objectNode.putArray("tagIds");
+            batchTagIds.forEach(tagId -> tagIdsNode.add(tagId.toString()));
+            sendJson(jsonRequest("PUT", "/api/tags/assets", objectNode));
+        }
     }
 
     private HttpRequest get(String path) {

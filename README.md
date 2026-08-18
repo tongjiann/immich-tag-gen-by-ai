@@ -182,4 +182,6 @@ PUT /api/tags/{tagId}/assets
 PUT /api/tags/assets
 ```
 
+单标签关联请求体会同时携带 `ids` 与 `assetIds` 两个字段：Immich v3 起该接口要求 `ids`，旧版本使用 `assetIds`，未知字段会被服务端忽略，因此两个世代均可正常工作。
+
 如果目标 Immich 版本修改了资产分页、缩略图或标签 API，请以该服务版本导出的 OpenAPI 文档为准调整 `ImmichHttpClient`。
