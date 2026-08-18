@@ -16,6 +16,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -39,6 +40,8 @@ public class PhotoProcessingService {
     private final JsonlStateStore stateStore;
     private final ProcessingProperties properties;
     private final String immichBaseUrl;
+    private Set<UUID> skipAlbumIds = Set.of();
+    private Set<String> skipAlbumNames = Set.of();
 
     public PhotoProcessingService(ImmichClient immichClient, VisionModelClient visionModelClient,
                                   TaxonomyLoader taxonomyLoader, JsonlStateStore stateStore,
@@ -61,12 +64,14 @@ public class PhotoProcessingService {
         log.info("Immich 标签索引加载完成");
         log.info("现有索引，{}", String.join("，", tagIndex.getFullPathTags()));
 
+        resolveSkippedAlbums();
+
         ProcessingSummary summary = new ProcessingSummary();
         if (assetId != null) {
             log.info("进入单图处理模式 assetId={}, dryRun={}", assetId, dryRun);
             summary.scanned();
             processAssetSafely(new ImmichAsset(assetId, "IMAGE", false, false, null), taxonomy,
-                    tagIndex, dryRun, summary);
+                    tagIndex, force, dryRun, summary);
             return summary;
         }
 
@@ -98,7 +103,7 @@ public class PhotoProcessingService {
                 log.info("本页图片任务已准备 page={}, pending={}, skipped={}",
                         page, pendingAssets.size(), skippedOnPage);
                 processedSinceModelRelease = processInBatches(executor, pendingAssets, taxonomy, tagIndex,
-                        dryRun, summary, processedSinceModelRelease);
+                        force, dryRun, summary, processedSinceModelRelease);
                 log.info("本页图片处理完成 page={}, progress=[{}]", page, summary);
                 if (!assetPage.hasMore()) {
                     break;
@@ -109,11 +114,76 @@ public class PhotoProcessingService {
         return summary;
     }
 
+    private void resolveSkippedAlbums() {
+        String configured = properties.getSkipAlbums();
+        if (configured == null || configured.isBlank()) {
+            skipAlbumIds = Set.of();
+            skipAlbumNames = Set.of();
+            return;
+        }
+        Set<UUID> ids = new HashSet<>();
+        Set<String> names = new HashSet<>();
+        for (String identifier : configured.split(",")) {
+            String value = identifier.trim();
+            if (value.isBlank()) {
+                continue;
+            }
+            UUID albumId = parseUuid(value);
+            if (albumId != null) {
+                ids.add(albumId);
+            } else {
+                names.add(value.toLowerCase(Locale.ROOT));
+            }
+        }
+        skipAlbumIds = Set.copyOf(ids);
+        skipAlbumNames = Set.copyOf(names);
+        log.info("已配置跳过相簿 albumIds={}, albumNames={}", skipAlbumIds, skipAlbumNames);
+    }
+
+    private boolean isInSkippedAlbum(UUID assetId) {
+        if (skipAlbumIds.isEmpty() && skipAlbumNames.isEmpty()) {
+            return false;
+        }
+        List<ImmichAlbum> albums = immichClient.listAlbumsByAsset(assetId);
+        for (ImmichAlbum album : albums) {
+            boolean idMatch = skipAlbumIds.contains(album.id());
+            boolean nameMatch = album.albumName() != null
+                    && skipAlbumNames.contains(album.albumName().toLowerCase(Locale.ROOT));
+            if (idMatch || nameMatch) {
+                log.info("资产所在相簿命中跳过配置 assetId={}, album={}({})",
+                        assetId, album.albumName(), album.id());
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private UUID parseUuid(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return UUID.fromString(value);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
     private void processAssetSafely(ImmichAsset asset, Taxonomy taxonomy, TagIndex tagIndex,
-                                    boolean dryRun, ProcessingSummary summary) {
+                                    boolean force, boolean dryRun, ProcessingSummary summary) {
         long assetStartedAt = System.nanoTime();
         log.info("开始处理图片，{}", assetPageUrl(asset.id()));
         try {
+            if (isInSkippedAlbum(asset.id())) {
+                summary.skipped();
+                log.info("图片属于跳过相簿，跳过处理 assetId={}", asset.id());
+                return;
+            }
+            if (!force && stateStore.isSuccessfullyProcessed(asset.id())) {
+                summary.skipped();
+                log.info("图片已设置过标签，按历史记录跳过处理 assetId={}", asset.id());
+                return;
+            }
             log.info("正在读取图片详情 assetId={}", asset.id());
             AssetDetail detail = immichClient.getAsset(asset.id());
             if (!detail.isImage()) {
@@ -434,7 +504,7 @@ public class PhotoProcessingService {
     }
 
     private int processInBatches(ExecutorService executor, List<ImmichAsset> assets, Taxonomy taxonomy,
-                                 TagIndex tagIndex, boolean dryRun, ProcessingSummary summary,
+                                 TagIndex tagIndex, boolean force, boolean dryRun, ProcessingSummary summary,
                                  int processedSinceModelRelease) {
         int start = 0;
         while (start < assets.size()) {
@@ -442,7 +512,7 @@ public class PhotoProcessingService {
             int end = Math.min(start + remainingBeforeRelease, assets.size());
             List<Future<?>> futures = new ArrayList<>(end - start);
             for (ImmichAsset asset : assets.subList(start, end)) {
-                futures.add(executor.submit(() -> processAssetSafely(asset, taxonomy, tagIndex, dryRun, summary)));
+                futures.add(executor.submit(() -> processAssetSafely(asset, taxonomy, tagIndex, force, dryRun, summary)));
             }
             awaitCompletion(futures);
             processedSinceModelRelease += end - start;

@@ -18,6 +18,8 @@ import java.util.UUID;
 
 @Component
 public class JsonlStateStore {
+    private static final String STATUS_SUCCESS = "SUCCESS";
+
     private final ObjectMapper objectMapper;
     private final Path stateFile;
     private final Map<UUID, ProcessingState> latestStates = new HashMap<>();
@@ -32,10 +34,15 @@ public class JsonlStateStore {
         return latestStates.get(assetId);
     }
 
+    public synchronized boolean isSuccessfullyProcessed(UUID assetId) {
+        ProcessingState state = latestStates.get(assetId);
+        return state != null && STATUS_SUCCESS.equals(state.status());
+    }
+
     public synchronized void appendSuccess(UUID assetId, String fileModifiedAt, String model,
                                             String promptVersion, int taxonomyVersion) {
         append(new ProcessingState(assetId, fileModifiedAt, model, promptVersion, taxonomyVersion,
-                "SUCCESS", Instant.now(), null));
+                STATUS_SUCCESS, Instant.now(), null));
     }
 
     public synchronized void appendFailure(UUID assetId, String fileModifiedAt, String model,

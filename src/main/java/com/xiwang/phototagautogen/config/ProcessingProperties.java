@@ -31,6 +31,7 @@ public class ProcessingProperties {
     private boolean force;
     private boolean dryRun;
     private String assetId;
+    private String skipAlbums;
     @Min(1)
     private int httpTimeoutSeconds = 30;
 
@@ -64,6 +65,8 @@ public class ProcessingProperties {
     public void setDryRun(boolean dryRun) { this.dryRun = dryRun; }
     public String getAssetId() { return assetId; }
     public void setAssetId(String assetId) { this.assetId = assetId; }
+    public String getSkipAlbums() { return skipAlbums; }
+    public void setSkipAlbums(String skipAlbums) { this.skipAlbums = skipAlbums; }
     public int getHttpTimeoutSeconds() { return httpTimeoutSeconds; }
     public void setHttpTimeoutSeconds(int httpTimeoutSeconds) { this.httpTimeoutSeconds = httpTimeoutSeconds; }
     public int getModelTimeoutSeconds() { return modelTimeoutSeconds; }

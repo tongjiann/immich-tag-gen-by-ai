@@ -8,6 +8,7 @@ import com.xiwang.phototagautogen.config.ImmichProperties;
 import com.xiwang.phototagautogen.config.ProcessingProperties;
 import com.xiwang.phototagautogen.domain.AssetDetail;
 import com.xiwang.phototagautogen.domain.AssetPage;
+import com.xiwang.phototagautogen.domain.ImmichAlbum;
 import com.xiwang.phototagautogen.domain.ImmichAsset;
 import com.xiwang.phototagautogen.domain.ImmichTag;
 import com.xiwang.phototagautogen.domain.TagIndex;
@@ -86,6 +87,41 @@ public class ImmichHttpClient implements ImmichClient {
             hasMore = true;
         }
         return new AssetPage(images, hasMore);
+    }
+
+    @Override
+    public List<ImmichAlbum> listAlbums() {
+        return parseAlbums(sendJson(get("/api/albums")));
+    }
+
+    @Override
+    public List<ImmichAlbum> listAlbumsByAsset(UUID assetId) {
+        return parseAlbums(sendJson(get("/api/albums?assetId=" + assetId)));
+    }
+
+    private List<ImmichAlbum> parseAlbums(JsonNode root) {
+        List<ImmichAlbum> albums = new ArrayList<>();
+        if (!root.isArray()) {
+            return albums;
+        }
+        for (JsonNode item : root) {
+            UUID id = parseUuid(textOrNull(item.get("id")));
+            if (id == null) {
+                continue;
+            }
+            List<UUID> assetIds = new ArrayList<>();
+            JsonNode assets = item.path("assets");
+            if (assets.isArray()) {
+                for (JsonNode asset : assets) {
+                    UUID assetId = parseUuid(textOrNull(asset.get("id")));
+                    if (assetId != null) {
+                        assetIds.add(assetId);
+                    }
+                }
+            }
+            albums.add(new ImmichAlbum(id, textOrNull(item.get("albumName")), assetIds));
+        }
+        return albums;
     }
 
     @Override

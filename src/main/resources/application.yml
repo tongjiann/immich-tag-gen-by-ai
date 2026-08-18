@@ -32,6 +32,7 @@ processing:
   force: ${PROCESSING_FORCE:false}
   dry-run: ${PROCESSING_DRY_RUN:false}
   asset-id: ${PROCESSING_ASSET_ID:}
+  skip-albums: ${PROCESSING_SKIP_ALBUMS:}
   http-timeout-seconds: ${PROCESSING_HTTP_TIMEOUT_SECONDS:30}
   model-timeout-seconds: ${PROCESSING_MODEL_TIMEOUT_SECONDS:300}
   connect-timeout-seconds: ${PROCESSING_CONNECT_TIMEOUT_SECONDS:5}

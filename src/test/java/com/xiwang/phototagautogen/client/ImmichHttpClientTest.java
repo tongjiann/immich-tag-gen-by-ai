@@ -8,6 +8,7 @@ import com.xiwang.phototagautogen.config.ImmichProperties;
 import com.xiwang.phototagautogen.config.ProcessingProperties;
 import com.xiwang.phototagautogen.domain.AssetDetail;
 import com.xiwang.phototagautogen.domain.AssetPage;
+import com.xiwang.phototagautogen.domain.ImmichAlbum;
 import com.xiwang.phototagautogen.domain.ImmichTag;
 import com.xiwang.phototagautogen.domain.TagIndex;
 import com.xiwang.phototagautogen.domain.TagPath;
@@ -29,6 +30,8 @@ class ImmichHttpClientTest {
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
     private final UUID assetId = UUID.randomUUID();
     private final UUID videoAssetId = UUID.randomUUID();
+    private final UUID albumId = UUID.randomUUID();
+    private final UUID albumAssetId = UUID.randomUUID();
     private final List<String> requests = new ArrayList<>();
     private final List<JsonNode> createdTagRequests = new ArrayList<>();
     private final List<UUID> createdTagIds = new ArrayList<>();
@@ -113,6 +116,29 @@ class ImmichHttpClientTest {
         assertThat(attachedTagsRequest.path("assetIds").get(0).asText()).isEqualTo(assetId.toString());
         assertThat(attachedTagsRequest.path("tagIds").get(0).asText()).isEqualTo(tagId.toString());
         assertThat(attachedSingleTagRequests).isEmpty();
+    }
+
+    @Test
+    void 列出相簿及相簿内资产Id() {
+        List<ImmichAlbum> albums = client.listAlbums();
+
+        assertThat(albums).hasSize(1);
+        ImmichAlbum album = albums.getFirst();
+        assertThat(album.id()).isEqualTo(albumId);
+        assertThat(album.albumName()).isEqualTo("旅行相册");
+        assertThat(album.assetIds()).containsExactly(albumAssetId);
+        assertThat(requests).contains("GET /api/albums");
+    }
+
+    @Test
+    void 按资产查询所在相簿时请求应携带assetId参数() {
+        List<ImmichAlbum> albums = client.listAlbumsByAsset(assetId);
+
+        assertThat(albums).hasSize(1);
+        assertThat(albums.getFirst().id()).isEqualTo(albumId);
+        assertThat(albums.getFirst().albumName()).isEqualTo("旅行相册");
+        assertThat(albums.getFirst().assetIds()).containsExactly(albumAssetId);
+        assertThat(requests).contains("GET /api/albums?assetId=" + assetId);
     }
 
     @Test
@@ -282,6 +308,11 @@ class ImmichHttpClientTest {
         int status = 200;
         if ("GET".equals(method) && "/api/server/version".equals(path)) {
             response = "{\"major\":\"2\",\"minor\":\"0\",\"patch\":\"0\"}";
+        } else if ("GET".equals(method) && "/api/albums".equals(path)) {
+            String rawQuery = exchange.getRequestURI().getRawQuery();
+            requests.add(method + " " + path + (rawQuery == null ? "" : "?" + rawQuery));
+            response = "[{\"id\":\"" + albumId + "\",\"albumName\":\"旅行相册\",\"assetCount\":1,"
+                    + "\"assets\":[{\"id\":\"" + albumAssetId + "\",\"type\":\"IMAGE\"}]}]";
         } else if ("POST".equals(method) && "/api/search/metadata".equals(path)) {
             response = "{\"albums\":[],\"assets\":{\"count\":2,\"facets\":[],\"items\":["
                     + "{\"id\":\"" + assetId + "\",\"type\":\"IMAGE\",\"isTrashed\":false,"

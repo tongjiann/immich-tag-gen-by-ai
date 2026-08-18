@@ -30,4 +30,30 @@ class JsonlStateStoreTest {
         assertThat(state.status()).isEqualTo("SUCCESS");
         assertThat(state.model()).isEqualTo("qwen2.5vl:7b");
     }
+
+    @Test
+    void 成功状态存在时应判定为已处理() {
+        ProcessingProperties properties = new ProcessingProperties();
+        properties.setStateFile(tempDir.resolve("processed-state.jsonl").toString());
+        JsonlStateStore store = new JsonlStateStore(new ObjectMapper().findAndRegisterModules(), properties);
+        UUID assetId = UUID.randomUUID();
+
+        store.appendSuccess(assetId, Instant.now().toString(), "qwen2.5vl:7b", "v1", 1);
+
+        assertThat(store.isSuccessfullyProcessed(assetId)).isTrue();
+    }
+
+    @Test
+    void 无状态或失败状态时不应判定为已处理() {
+        ProcessingProperties properties = new ProcessingProperties();
+        properties.setStateFile(tempDir.resolve("not-processed-state.jsonl").toString());
+        JsonlStateStore store = new JsonlStateStore(new ObjectMapper().findAndRegisterModules(), properties);
+        UUID assetId = UUID.randomUUID();
+
+        assertThat(store.isSuccessfullyProcessed(assetId)).isFalse();
+
+        store.appendFailure(assetId, Instant.now().toString(), "qwen2.5vl:7b", "v1", 1, "http-504");
+
+        assertThat(store.isSuccessfullyProcessed(assetId)).isFalse();
+    }
 }

@@ -9,6 +9,7 @@ import com.xiwang.phototagautogen.domain.AssetDetail;
 import com.xiwang.phototagautogen.domain.AssetPage;
 import com.xiwang.phototagautogen.domain.GeneratedTag;
 import com.xiwang.phototagautogen.domain.ImageAnalysis;
+import com.xiwang.phototagautogen.domain.ImmichAlbum;
 import com.xiwang.phototagautogen.domain.ImmichAsset;
 import com.xiwang.phototagautogen.domain.ImmichTag;
 import com.xiwang.phototagautogen.domain.ProcessingSummary;
@@ -47,7 +48,7 @@ class PhotoProcessingServiceTest {
     Path tempDir;
 
     @Test
-    void 已有人工描述时只补充标签且后续实时已有标签时跳过推理(CapturedOutput output) {
+    void 已有人工描述时只补充标签且后续运行按历史记录跳过推理(CapturedOutput output) {
         ImmichClient immichClient = mock(ImmichClient.class);
         VisionModelClient modelClient = mock(VisionModelClient.class);
         UUID assetId = UUID.randomUUID();
@@ -65,7 +66,7 @@ class PhotoProcessingServiceTest {
         when(modelClient.modelName()).thenReturn("qwen2.5vl:7b");
         when(immichClient.listTags()).thenReturn(new TagIndex());
         when(immichClient.listImages(1, 100)).thenReturn(new AssetPage(List.of(asset), false));
-        when(immichClient.getAsset(assetId)).thenReturn(untaggedDetail, untaggedDetail, taggedDetail);
+        when(immichClient.getAsset(assetId)).thenReturn(untaggedDetail, untaggedDetail);
         when(immichClient.downloadPreview(assetId)).thenReturn(new byte[] {1, 2, 3});
         when(modelClient.analyze(any(), eq(taxonomy))).thenReturn(new ImageAnalysis(
                 "模型描述", List.of(new GeneratedTag(List.of("季节", "春"), new BigDecimal("0.95"))), false));
@@ -82,6 +83,7 @@ class PhotoProcessingServiceTest {
         assertThat(second.skippedCount()).isEqualTo(1);
         verify(immichClient, never()).updateDescription(any(), any());
         verify(immichClient, times(1)).attachTags(eq(assetId), any());
+        verify(immichClient, times(2)).getAsset(assetId);
         verify(modelClient, times(1)).analyze(any(), eq(taxonomy));
         assertThat(output).contains(
                 "开始处理图片，http://immich.test/photos/" + assetId,
@@ -90,11 +92,45 @@ class PhotoProcessingServiceTest {
                 "模型结果校验完成 assetId=" + assetId + "，接受的标签=[季节/春(0.95)]",
                 "Immich 写回完成 assetId=" + assetId
                         + ", descriptionUpdated=false, newTagCount=1, newTags=[季节/春]",
-                "图片已存在标签，跳过模型调用 assetId=" + assetId + ", tagCount=1");
+                "图片已设置过标签，按历史记录跳过处理 assetId=" + assetId);
     }
 
     @Test
-    void 成功状态存在但实时标签为空时仍应重新推理() {
+    void 成功状态存在时即使实时标签为空也应跳过() {
+        ImmichClient immichClient = mock(ImmichClient.class);
+        VisionModelClient modelClient = mock(VisionModelClient.class);
+        UUID assetId = UUID.randomUUID();
+        Instant modifiedAt = Instant.parse("2026-07-21T00:00:00Z");
+        ImmichAsset asset = new ImmichAsset(assetId, "IMAGE", false, false, modifiedAt);
+        Taxonomy taxonomy = new Taxonomy(1, Map.of("季节", Map.of("", List.of("春"))));
+        ProcessingProperties properties = properties(tempDir.resolve("successful-but-untagged-state.jsonl"));
+        JsonlStateStore stateStore = new JsonlStateStore(new ObjectMapper().findAndRegisterModules(), properties);
+        stateStore.appendSuccess(assetId, modifiedAt.toString(), "qwen2.5vl:7b",
+                properties.getPromptVersion(), taxonomy.version());
+        TaxonomyLoader taxonomyLoader = mock(TaxonomyLoader.class);
+
+        when(taxonomyLoader.load()).thenReturn(taxonomy);
+        when(modelClient.modelName()).thenReturn("qwen2.5vl:7b");
+        when(immichClient.listTags()).thenReturn(new TagIndex());
+        when(immichClient.listImages(1, 100)).thenReturn(new AssetPage(List.of(asset), false));
+
+        PhotoProcessingService service = new PhotoProcessingService(immichClient, modelClient, taxonomyLoader,
+                stateStore, properties, immichProperties());
+
+        ProcessingSummary summary = service.run(false, false, null);
+
+        assertThat(summary.skippedCount()).isEqualTo(1);
+        assertThat(summary.analyzedCount()).isZero();
+        assertThat(summary.failures()).isZero();
+        verify(immichClient, never()).getAsset(assetId);
+        verify(immichClient, never()).downloadPreview(any());
+        verify(modelClient, never()).analyze(any(), eq(taxonomy));
+        verify(immichClient, never()).updateDescription(any(), any());
+        verify(immichClient, never()).attachTags(any(), any());
+    }
+
+    @Test
+    void force模式应绕过成功历史重新处理() {
         ImmichClient immichClient = mock(ImmichClient.class);
         VisionModelClient modelClient = mock(VisionModelClient.class);
         UUID assetId = UUID.randomUUID();
@@ -103,7 +139,7 @@ class PhotoProcessingServiceTest {
         ImmichAsset asset = new ImmichAsset(assetId, "IMAGE", false, false, modifiedAt);
         AssetDetail detail = new AssetDetail(assetId, "IMAGE", null, modifiedAt, List.of());
         Taxonomy taxonomy = new Taxonomy(1, Map.of("季节", Map.of("", List.of("春"))));
-        ProcessingProperties properties = properties(tempDir.resolve("successful-but-untagged-state.jsonl"));
+        ProcessingProperties properties = properties(tempDir.resolve("force-reprocess-state.jsonl"));
         JsonlStateStore stateStore = new JsonlStateStore(new ObjectMapper().findAndRegisterModules(), properties);
         stateStore.appendSuccess(assetId, modifiedAt.toString(), "qwen2.5vl:7b",
                 properties.getPromptVersion(), taxonomy.version());
@@ -116,9 +152,150 @@ class PhotoProcessingServiceTest {
         when(immichClient.getAsset(assetId)).thenReturn(detail);
         when(immichClient.downloadPreview(assetId)).thenReturn(new byte[] {1, 2, 3});
         when(modelClient.analyze(any(), eq(taxonomy))).thenReturn(new ImageAnalysis(
-                "重新生成的描述", List.of(
+                "强制重处理的描述", List.of(
                 new GeneratedTag(List.of("季节", "春"), new BigDecimal("0.95"))), false));
         when(immichClient.ensureTagPath(any(), any())).thenReturn(tagId);
+
+        PhotoProcessingService service = new PhotoProcessingService(immichClient, modelClient, taxonomyLoader,
+                stateStore, properties, immichProperties());
+
+        ProcessingSummary summary = service.run(true, false, null);
+
+        assertThat(summary.skippedCount()).isZero();
+        assertThat(summary.analyzedCount()).isEqualTo(1);
+        assertThat(summary.failures()).isZero();
+        verify(modelClient).analyze(any(), eq(taxonomy));
+        verify(immichClient).updateDescription(assetId, "强制重处理的描述");
+        verify(immichClient).attachTags(eq(assetId), any());
+    }
+
+    @Test
+    void 配置跳过相簿名称时该相簿图片应跳过处理(CapturedOutput output) {
+        ImmichClient immichClient = mock(ImmichClient.class);
+        VisionModelClient modelClient = mock(VisionModelClient.class);
+        UUID albumId = UUID.randomUUID();
+        UUID assetId = UUID.randomUUID();
+        Instant modifiedAt = Instant.parse("2026-07-21T00:00:00Z");
+        ImmichAsset asset = new ImmichAsset(assetId, "IMAGE", false, false, modifiedAt);
+        Taxonomy taxonomy = new Taxonomy(1, Map.of("季节", Map.of("", List.of("春"))));
+        ProcessingProperties properties = properties(tempDir.resolve("skip-album-name-state.jsonl"));
+        properties.setSkipAlbums("旅行相册");
+        JsonlStateStore stateStore = new JsonlStateStore(new ObjectMapper().findAndRegisterModules(), properties);
+        TaxonomyLoader taxonomyLoader = mock(TaxonomyLoader.class);
+
+        when(taxonomyLoader.load()).thenReturn(taxonomy);
+        when(modelClient.modelName()).thenReturn("qwen2.5vl:7b");
+        when(immichClient.listTags()).thenReturn(new TagIndex());
+        when(immichClient.listAlbumsByAsset(assetId)).thenReturn(List.of(
+                new ImmichAlbum(albumId, "旅行相册", List.of(assetId))));
+        when(immichClient.listImages(1, 100)).thenReturn(new AssetPage(List.of(asset), false));
+
+        PhotoProcessingService service = new PhotoProcessingService(immichClient, modelClient, taxonomyLoader,
+                stateStore, properties, immichProperties());
+
+        ProcessingSummary summary = service.run(false, false, null);
+
+        assertThat(summary.scannedCount()).isEqualTo(1);
+        assertThat(summary.skippedCount()).isEqualTo(1);
+        assertThat(summary.analyzedCount()).isZero();
+        assertThat(summary.failures()).isZero();
+        verify(immichClient).listAlbumsByAsset(assetId);
+        verify(immichClient, never()).getAsset(any());
+        verify(immichClient, never()).downloadPreview(any());
+        verify(modelClient, never()).analyze(any(), any());
+        assertThat(output).contains(
+                "已配置跳过相簿 albumIds=[], albumNames=[旅行相册]",
+                "图片属于跳过相簿，跳过处理 assetId=" + assetId);
+    }
+
+    @Test
+    void 配置跳过相簿Id时该相簿图片应跳过处理() {
+        ImmichClient immichClient = mock(ImmichClient.class);
+        VisionModelClient modelClient = mock(VisionModelClient.class);
+        UUID albumId = UUID.randomUUID();
+        UUID assetId = UUID.randomUUID();
+        Instant modifiedAt = Instant.parse("2026-07-21T00:00:00Z");
+        ImmichAsset asset = new ImmichAsset(assetId, "IMAGE", false, false, modifiedAt);
+        Taxonomy taxonomy = new Taxonomy(1, Map.of("季节", Map.of("", List.of("春"))));
+        ProcessingProperties properties = properties(tempDir.resolve("skip-album-id-state.jsonl"));
+        properties.setSkipAlbums(albumId.toString());
+        JsonlStateStore stateStore = new JsonlStateStore(new ObjectMapper().findAndRegisterModules(), properties);
+        TaxonomyLoader taxonomyLoader = mock(TaxonomyLoader.class);
+
+        when(taxonomyLoader.load()).thenReturn(taxonomy);
+        when(modelClient.modelName()).thenReturn("qwen2.5vl:7b");
+        when(immichClient.listTags()).thenReturn(new TagIndex());
+        when(immichClient.listAlbumsByAsset(assetId)).thenReturn(List.of(
+                new ImmichAlbum(albumId, "旅行相册", List.of(assetId))));
+        when(immichClient.listImages(1, 100)).thenReturn(new AssetPage(List.of(asset), false));
+
+        PhotoProcessingService service = new PhotoProcessingService(immichClient, modelClient, taxonomyLoader,
+                stateStore, properties, immichProperties());
+
+        ProcessingSummary summary = service.run(false, false, null);
+
+        assertThat(summary.skippedCount()).isEqualTo(1);
+        assertThat(summary.analyzedCount()).isZero();
+        assertThat(summary.failures()).isZero();
+        verify(immichClient, never()).getAsset(any());
+        verify(immichClient, never()).downloadPreview(any());
+        verify(modelClient, never()).analyze(any(), any());
+    }
+
+    @Test
+    void 单图模式图片属于跳过相簿时应直接跳过() {
+        ImmichClient immichClient = mock(ImmichClient.class);
+        VisionModelClient modelClient = mock(VisionModelClient.class);
+        UUID albumId = UUID.randomUUID();
+        UUID assetId = UUID.randomUUID();
+        Taxonomy taxonomy = new Taxonomy(1, Map.of("季节", Map.of("", List.of("春"))));
+        ProcessingProperties properties = properties(tempDir.resolve("skip-album-single-state.jsonl"));
+        properties.setSkipAlbums("旅行相册");
+        JsonlStateStore stateStore = new JsonlStateStore(new ObjectMapper().findAndRegisterModules(), properties);
+        TaxonomyLoader taxonomyLoader = mock(TaxonomyLoader.class);
+
+        when(taxonomyLoader.load()).thenReturn(taxonomy);
+        when(modelClient.modelName()).thenReturn("qwen2.5vl:7b");
+        when(immichClient.listTags()).thenReturn(new TagIndex());
+        when(immichClient.listAlbumsByAsset(assetId)).thenReturn(List.of(
+                new ImmichAlbum(albumId, "旅行相册", List.of(assetId))));
+
+        PhotoProcessingService service = new PhotoProcessingService(immichClient, modelClient, taxonomyLoader,
+                stateStore, properties, immichProperties());
+
+        ProcessingSummary summary = service.run(false, false, assetId);
+
+        assertThat(summary.scannedCount()).isEqualTo(1);
+        assertThat(summary.skippedCount()).isEqualTo(1);
+        assertThat(summary.analyzedCount()).isZero();
+        assertThat(summary.failures()).isZero();
+        verify(immichClient, never()).getAsset(any());
+        verify(immichClient, never()).downloadPreview(any());
+        verify(modelClient, never()).analyze(any(), any());
+    }
+
+    @Test
+    void 未配置跳过相簿时不应请求相簿列表() {
+        ImmichClient immichClient = mock(ImmichClient.class);
+        VisionModelClient modelClient = mock(VisionModelClient.class);
+        UUID assetId = UUID.randomUUID();
+        Instant modifiedAt = Instant.parse("2026-07-21T00:00:00Z");
+        ImmichAsset asset = new ImmichAsset(assetId, "IMAGE", false, false, modifiedAt);
+        AssetDetail detail = new AssetDetail(assetId, "IMAGE", null, modifiedAt, List.of());
+        Taxonomy taxonomy = new Taxonomy(1, Map.of("季节", Map.of("", List.of("春"))));
+        ProcessingProperties properties = properties(tempDir.resolve("no-skip-album-state.jsonl"));
+        JsonlStateStore stateStore = new JsonlStateStore(new ObjectMapper().findAndRegisterModules(), properties);
+        TaxonomyLoader taxonomyLoader = mock(TaxonomyLoader.class);
+
+        when(taxonomyLoader.load()).thenReturn(taxonomy);
+        when(modelClient.modelName()).thenReturn("qwen2.5vl:7b");
+        when(immichClient.listTags()).thenReturn(new TagIndex());
+        when(immichClient.listImages(1, 100)).thenReturn(new AssetPage(List.of(asset), false));
+        when(immichClient.getAsset(assetId)).thenReturn(detail);
+        when(immichClient.downloadPreview(assetId)).thenReturn(new byte[] {1, 2, 3});
+        when(modelClient.analyze(any(), eq(taxonomy))).thenReturn(new ImageAnalysis(
+                "模型描述", List.of(new GeneratedTag(List.of("季节", "春"), new BigDecimal("0.95"))), false));
+        when(immichClient.ensureTagPath(any(), any())).thenReturn(UUID.randomUUID());
 
         PhotoProcessingService service = new PhotoProcessingService(immichClient, modelClient, taxonomyLoader,
                 stateStore, properties, immichProperties());
@@ -127,8 +304,46 @@ class PhotoProcessingServiceTest {
 
         assertThat(summary.analyzedCount()).isEqualTo(1);
         assertThat(summary.failures()).isZero();
-        verify(modelClient).analyze(any(), eq(taxonomy));
-        verify(immichClient).attachTags(eq(assetId), any());
+        verify(immichClient, never()).listAlbums();
+        verify(immichClient, never()).listAlbumsByAsset(any());
+    }
+
+    @Test
+    void 资产所在相簿未命中跳过配置时应正常处理() {
+        ImmichClient immichClient = mock(ImmichClient.class);
+        VisionModelClient modelClient = mock(VisionModelClient.class);
+        UUID albumId = UUID.randomUUID();
+        UUID assetId = UUID.randomUUID();
+        Instant modifiedAt = Instant.parse("2026-07-21T00:00:00Z");
+        ImmichAsset asset = new ImmichAsset(assetId, "IMAGE", false, false, modifiedAt);
+        AssetDetail detail = new AssetDetail(assetId, "IMAGE", null, modifiedAt, List.of());
+        Taxonomy taxonomy = new Taxonomy(1, Map.of("季节", Map.of("", List.of("春"))));
+        ProcessingProperties properties = properties(tempDir.resolve("album-not-skipped-state.jsonl"));
+        properties.setSkipAlbums("大师作品");
+        JsonlStateStore stateStore = new JsonlStateStore(new ObjectMapper().findAndRegisterModules(), properties);
+        TaxonomyLoader taxonomyLoader = mock(TaxonomyLoader.class);
+
+        when(taxonomyLoader.load()).thenReturn(taxonomy);
+        when(modelClient.modelName()).thenReturn("qwen2.5vl:7b");
+        when(immichClient.listTags()).thenReturn(new TagIndex());
+        when(immichClient.listAlbumsByAsset(assetId)).thenReturn(List.of(
+                new ImmichAlbum(albumId, "旅行相册", List.of(assetId))));
+        when(immichClient.listImages(1, 100)).thenReturn(new AssetPage(List.of(asset), false));
+        when(immichClient.getAsset(assetId)).thenReturn(detail);
+        when(immichClient.downloadPreview(assetId)).thenReturn(new byte[] {1, 2, 3});
+        when(modelClient.analyze(any(), eq(taxonomy))).thenReturn(new ImageAnalysis(
+                "模型描述", List.of(new GeneratedTag(List.of("季节", "春"), new BigDecimal("0.95"))), false));
+        when(immichClient.ensureTagPath(any(), any())).thenReturn(UUID.randomUUID());
+
+        PhotoProcessingService service = new PhotoProcessingService(immichClient, modelClient, taxonomyLoader,
+                stateStore, properties, immichProperties());
+
+        ProcessingSummary summary = service.run(false, false, null);
+
+        assertThat(summary.skippedCount()).isZero();
+        assertThat(summary.analyzedCount()).isEqualTo(1);
+        assertThat(summary.failures()).isZero();
+        verify(immichClient).listAlbumsByAsset(assetId);
     }
 
     @Test
