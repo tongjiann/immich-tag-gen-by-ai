@@ -29,6 +29,7 @@ public class ProcessingProperties {
     @NotBlank
     private String stateFile = ".data/processing-state.jsonl";
     private boolean force;
+    private boolean incremental = true;
     private boolean dryRun;
     private String assetId;
     private String skipAlbums;
@@ -61,6 +62,8 @@ public class ProcessingProperties {
     public void setStateFile(String stateFile) { this.stateFile = stateFile; }
     public boolean isForce() { return force; }
     public void setForce(boolean force) { this.force = force; }
+    public boolean isIncremental() { return incremental; }
+    public void setIncremental(boolean incremental) { this.incremental = incremental; }
     public boolean isDryRun() { return dryRun; }
     public void setDryRun(boolean dryRun) { this.dryRun = dryRun; }
     public String getAssetId() { return assetId; }

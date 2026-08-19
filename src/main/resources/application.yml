@@ -30,6 +30,7 @@ processing:
   concurrency: ${PROCESSING_CONCURRENCY:4}
   state-file: ${PROCESSING_STATE_FILE:.data/processing-state.jsonl}
   force: ${PROCESSING_FORCE:false}
+  incremental: ${PROCESSING_INCREMENTAL:true}
   dry-run: ${PROCESSING_DRY_RUN:false}
   asset-id: ${PROCESSING_ASSET_ID:}
   skip-albums: ${PROCESSING_SKIP_ALBUMS:}

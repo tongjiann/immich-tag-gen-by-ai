@@ -85,18 +85,61 @@ class PhotoProcessingServiceTest {
         verify(immichClient, times(1)).attachTags(eq(assetId), any());
         verify(immichClient, times(2)).getAsset(assetId);
         verify(modelClient, times(1)).analyze(any(), eq(taxonomy));
+        String startLog = "开始处理图片，http://immich.test/photos/" + assetId;
         assertThat(output).contains(
-                "开始处理图片，http://immich.test/photos/" + assetId,
+                startLog,
                 "description=模型描述",
                 "tags=[季节/春(0.95)]",
                 "模型结果校验完成 assetId=" + assetId + "，接受的标签=[季节/春(0.95)]",
                 "Immich 写回完成 assetId=" + assetId
-                        + ", descriptionUpdated=false, newTagCount=1, newTags=[季节/春]",
-                "图片已设置过标签，按历史记录跳过处理 assetId=" + assetId);
+                        + ", descriptionUpdated=false, newTagCount=1, newTags=[季节/春]");
+        assertThat(output.getOut())
+                .containsOnlyOnce(startLog)
+                .doesNotContain("图片已设置过标签，按历史记录跳过处理 assetId=" + assetId);
+        assertThat(output.getOut().indexOf(startLog))
+                .isGreaterThan(output.getOut().indexOf("正在读取图片详情 assetId=" + assetId));
     }
 
     @Test
-    void 成功状态存在时即使实时标签为空也应跳过() {
+    void 增量模式应复用图片标签和相簿读取结果(CapturedOutput output) {
+        ImmichClient immichClient = mock(ImmichClient.class);
+        VisionModelClient modelClient = mock(VisionModelClient.class);
+        UUID assetId = UUID.randomUUID();
+        Instant modifiedAt = Instant.parse("2026-08-19T00:00:00Z");
+        AssetDetail detail = new AssetDetail(assetId, "IMAGE", "已有描述", modifiedAt,
+                List.of(new ImmichTag(UUID.randomUUID(), "已有标签", null)));
+        ImmichAlbum album = new ImmichAlbum(UUID.randomUUID(), "未命中相簿", List.of(assetId));
+        Taxonomy taxonomy = new Taxonomy(1, Map.of("季节", Map.of("", List.of("春"))));
+        ProcessingProperties properties = properties(tempDir.resolve("incremental-read-state.jsonl"));
+        properties.setSkipAlbums("旅行相册");
+        JsonlStateStore stateStore = new JsonlStateStore(new ObjectMapper().findAndRegisterModules(), properties);
+        TaxonomyLoader taxonomyLoader = mock(TaxonomyLoader.class);
+
+        when(taxonomyLoader.load()).thenReturn(taxonomy);
+        when(modelClient.modelName()).thenReturn("qwen2.5vl:7b");
+        when(immichClient.listTags()).thenReturn(new TagIndex());
+        when(immichClient.listImages(1, 100)).thenReturn(new AssetPage(List.of(
+                new ImmichAsset(assetId, "IMAGE", false, false, modifiedAt)), false));
+        when(immichClient.listAlbumsByAsset(assetId)).thenReturn(List.of(album));
+        when(immichClient.getAsset(assetId)).thenReturn(detail);
+
+        PhotoProcessingService service = new PhotoProcessingService(immichClient, modelClient, taxonomyLoader,
+                stateStore, properties, immichProperties());
+
+        service.run(false, false, null);
+        ProcessingSummary second = service.run(false, false, null);
+
+        assertThat(second.skippedCount()).isEqualTo(1);
+        verify(immichClient, times(1)).listAlbumsByAsset(assetId);
+        verify(immichClient, times(1)).getAsset(assetId);
+        verify(modelClient, never()).analyze(any(), any());
+        assertThat(output.getOut())
+                .containsOnlyOnce("图片已存在标签，跳过模型调用 assetId=" + assetId + ", tagCount=1")
+                .doesNotContain("开始处理图片，http://immich.test/photos/" + assetId);
+    }
+
+    @Test
+    void 成功状态存在时即使实时标签为空也应跳过(CapturedOutput output) {
         ImmichClient immichClient = mock(ImmichClient.class);
         VisionModelClient modelClient = mock(VisionModelClient.class);
         UUID assetId = UUID.randomUUID();
@@ -127,6 +170,9 @@ class PhotoProcessingServiceTest {
         verify(modelClient, never()).analyze(any(), eq(taxonomy));
         verify(immichClient, never()).updateDescription(any(), any());
         verify(immichClient, never()).attachTags(any(), any());
+        assertThat(output.getOut()).doesNotContain(
+                "图片已设置过标签，按历史记录跳过处理 assetId=" + assetId,
+                "开始处理图片，http://immich.test/photos/" + assetId);
     }
 
     @Test
@@ -193,19 +239,23 @@ class PhotoProcessingServiceTest {
         PhotoProcessingService service = new PhotoProcessingService(immichClient, modelClient, taxonomyLoader,
                 stateStore, properties, immichProperties());
 
-        ProcessingSummary summary = service.run(false, false, null);
+        ProcessingSummary first = service.run(false, false, null);
+        ProcessingSummary second = service.run(false, false, null);
 
-        assertThat(summary.scannedCount()).isEqualTo(1);
-        assertThat(summary.skippedCount()).isEqualTo(1);
-        assertThat(summary.analyzedCount()).isZero();
-        assertThat(summary.failures()).isZero();
-        verify(immichClient).listAlbumsByAsset(assetId);
+        assertThat(first.scannedCount()).isEqualTo(1);
+        assertThat(first.skippedCount()).isEqualTo(1);
+        assertThat(first.analyzedCount()).isZero();
+        assertThat(first.failures()).isZero();
+        assertThat(second.skippedCount()).isEqualTo(1);
+        assertThat(second.failures()).isZero();
+        verify(immichClient, times(1)).listAlbumsByAsset(assetId);
         verify(immichClient, never()).getAsset(any());
         verify(immichClient, never()).downloadPreview(any());
         verify(modelClient, never()).analyze(any(), any());
-        assertThat(output).contains(
-                "已配置跳过相簿 albumIds=[], albumNames=[旅行相册]",
-                "图片属于跳过相簿，跳过处理 assetId=" + assetId);
+        assertThat(output).contains("已配置跳过相簿 albumIds=[], albumNames=[旅行相册]");
+        assertThat(output.getOut())
+                .containsOnlyOnce("图片属于跳过相簿，跳过处理 assetId=" + assetId)
+                .doesNotContain("开始处理图片，http://immich.test/photos/" + assetId);
     }
 
     @Test

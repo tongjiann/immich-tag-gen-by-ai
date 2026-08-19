@@ -36,14 +36,15 @@ public class PhotoTagCommandLineRunner implements CommandLineRunner, ExitCodeGen
         try {
             boolean force = properties.isForce() || hasBooleanOption(args, "processing.force");
             boolean dryRun = properties.isDryRun() || hasBooleanOption(args, "processing.dry-run");
+            boolean incremental = resolveIncremental(args);
             UUID assetId = parseAssetId(args);
 
             log.info("开始验证 Immich 和视觉模型接口连接，model={}", visionModelClient.modelName());
             immichClient.validateConnection();
             visionModelClient.validateConnection();
-            log.info("连接验证完成，force={}, dryRun={}", force, dryRun);
+            log.info("连接验证完成，force={}, dryRun={}, incremental={}", force, dryRun, incremental);
 
-            ProcessingSummary summary = processingService.run(force, dryRun, assetId);
+            ProcessingSummary summary = processingService.run(force, dryRun, assetId, incremental);
             log.info("批处理完成：{}", summary);
             exitCode = summary.failures() == 0 ? 0 : 2;
         } catch (Exception e) {
@@ -68,6 +69,19 @@ public class PhotoTagCommandLineRunner implements CommandLineRunner, ExitCodeGen
             return null;
         }
         return UUID.fromString(configured);
+    }
+
+    private boolean resolveIncremental(String[] args) {
+        boolean incremental = properties.isIncremental();
+        for (String arg : args) {
+            if (arg.startsWith("--processing.incremental=")) {
+                incremental = Boolean.parseBoolean(arg.substring("--processing.incremental=".length()));
+            } else if ("--processing.full".equals(arg)
+                    || "--processing.full=true".equalsIgnoreCase(arg)) {
+                incremental = false;
+            }
+        }
+        return incremental;
     }
 
     private boolean hasBooleanOption(String[] args, String name) {

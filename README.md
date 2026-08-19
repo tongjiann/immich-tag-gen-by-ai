@@ -8,8 +8,9 @@
 - 支持 Ollama `/api/chat` 和 OpenAI 兼容 `/v1/chat/completions` 多模态接口，不把图片写入本地文件。
 - 仅为空白描述写入模型描述，不覆盖人工描述。
 - 仅添加 `taxonomy.yml` 中允许的多级标签，不删除或覆盖已有标签。
-- 使用 JSONL 保存最小化处理结果，用于成功/失败审计和问题排查；已成功设置过标签的图片默认跳过，`force` 可重新处理。
-- 支持全量执行、dry-run 和单图片调试，并保留 `force` 兼容参数。
+- 使用 JSONL 保存处理结果和图片详情读取缓存，用于成功/失败审计、问题排查和增量读取；默认复用文件未变化图片的标签/相簿读取结果。
+- 默认使用增量读取模式；可通过 `--processing.full=true` 或 `--processing.incremental=false` 强制重新读取所有图片的标签/相簿。
+- 支持 dry-run 和单图片调试，并保留 `force` 兼容参数。
 - 支持按相簿名称或相簿 ID 配置跳过指定相簿中的图片。
 
 ## 环境要求
@@ -92,10 +93,24 @@ source .env
 set +a
 ```
 
-正常全量运行：
+正常增量运行（默认）：
 
 ```bash
 java -jar target/immich-tag-gen-by-ai-0.1.0-SNAPSHOT.jar
+```
+
+强制全量读取图片标签/相簿：
+
+```bash
+java -jar target/immich-tag-gen-by-ai-0.1.0-SNAPSHOT.jar \
+  --processing.full=true
+```
+
+也可以使用增量开关的反向写法：
+
+```bash
+java -jar target/immich-tag-gen-by-ai-0.1.0-SNAPSHOT.jar \
+  --processing.incremental=false
 ```
 
 首次建议先对单张图片执行 dry-run：
@@ -139,7 +154,8 @@ java -jar target/immich-tag-gen-by-ai-0.1.0-SNAPSHOT.jar \
 | `PROCESSING_CONFIDENCE_THRESHOLD` | `0.65` | 标签置信度阈值 |
 | `PROCESSING_PROMPT_VERSION` | `v4` | 提示词协议版本 |
 | `PROCESSING_STATE_FILE` | `.data/processing-state.jsonl` | 本地状态文件 |
-| `PROCESSING_FORCE` | `false` | 绕过 JSONL 成功历史，重新处理已成功设置过标签的图片；不绕过实时已有标签保护 |
+| `PROCESSING_FORCE` | `false` | 增量模式下绕过 JSONL 成功历史，重新处理已成功设置过标签的图片；不绕过实时已有标签保护 |
+| `PROCESSING_INCREMENTAL` | `true` | 是否复用相同 `fileModifiedAt` 图片的标签/相簿读取缓存；命令行可用 `--processing.full=true` 或 `--processing.incremental=false` 临时关闭 |
 | `PROCESSING_DRY_RUN` | `false` | 是否禁止写回和状态更新 |
 | `PROCESSING_ASSET_ID` | 空 | 指定单张图片 UUID |
 | `PROCESSING_SKIP_ALBUMS` | 空 | 逗号分隔的相簿名称或相簿 ID，处理每个资产前查询其所在相簿，命中指定相簿的图片直接跳过 |
@@ -147,7 +163,7 @@ java -jar target/immich-tag-gen-by-ai-0.1.0-SNAPSHOT.jar \
 ## 处理规则
 
 1. 启动时验证 Immich、API Key 和所选视觉模型接口。
-2. 全量扫描图片并读取实时资产详情；JSONL 中存在成功处理历史的图片直接跳过，`force` 可绕过。已有任意标签时同样跳过模型调用，不覆盖已有标签。
+2. 扫描图片列表。增量模式按图片 `fileModifiedAt` 复用 JSONL 中的图片详情、标签和相簿读取结果；未命中缓存或文件发生变化时重新读取。全量模式忽略读取缓存和成功历史快捷跳过，重新读取图片详情及配置了跳过相簿时的相簿信息。已有任意标签时同样跳过模型调用，不覆盖已有标签。
 3. 下载 Immich 预览图并调用所选视觉模型；Ollama 模式每处理一批图片后主动卸载模型，避免长期运行时模型内存持续占用。
 4. 模型 JSON 必须返回布尔字段 `portraitSubject`；每个标签还必须返回与完整路径一致的父级路径字段 `parentTag`。当主体是清晰可见的人时为 `true`；多人照片只描述最主要或最清晰的主体人物。
 5. Java 按置信度、词表路径、去重和 15 标签上限依次过滤，再校验人像规则。`portraitSubject=true` 时，`人脸角度`、`姿态`、`景别`、`服饰类型`、`主体颜色`、`配饰`、`场景`、`拍摄风格` 8 类必须各保留至少一个 `人像/<分类>/<标签>`；否则整张图片处理失败，不写入描述或标签。
@@ -155,9 +171,9 @@ java -jar target/immich-tag-gen-by-ai-0.1.0-SNAPSHOT.jar \
 7. 对每条校验通过的标签路径，先复用完整路径；若不存在，则从最近的已存在父级开始逐层创建。父级节点只维护树结构，资产仅关联每条计划标签的叶子标签 ID。
 8. 写回前再次读取实时资产详情；若分析期间已新增任意标签，则放弃本次描述和标签写回。描述只填空白值，不迁移或删除旧 `人物/...` 标签。
 9. 单张失败不会终止全局任务，最后输出处理汇总。
-10. 配置 `PROCESSING_SKIP_ALBUMS` 后，处理每个资产前通过 Immich 相簿接口查询该资产所在的相簿；命中配置的相簿（按名称或 ID 匹配）则跳过，不调用模型，也不写入本地状态。
+10. 配置 `PROCESSING_SKIP_ALBUMS` 后，处理每个资产前通过 Immich 相簿接口查询该资产所在的相簿；命中配置的相簿（按名称或 ID 匹配）则跳过，不调用模型，但会在非 dry-run 模式缓存本次相簿读取结果。
 
-JSONL 状态记录图片 `fileModifiedAt`、模型名称、提示词版本、词表版本和处理结果，用于审计与排查；记录 `SUCCESS` 的图片在后续运行中默认跳过，`--processing.force=true` 可绕过。当前默认提示词版本为 `v4`，词表版本为 `3`。修改 `taxonomy.yml` 时应同步递增其中的 `version`。
+JSONL 状态记录图片 `fileModifiedAt`、详情读取结果（描述、标签及已读取的相簿）、模型名称、提示词版本、词表版本和处理结果，用于审计、排查和增量缓存；记录 `SUCCESS` 的图片在增量模式后续运行中默认跳过，`--processing.force=true` 可绕过。当前默认提示词版本为 `v4`，词表版本为 `3`。修改 `taxonomy.yml` 时应同步递增其中的 `version`。
 
 ## 退出码
 

@@ -55,6 +55,10 @@ public class PhotoProcessingService {
     }
 
     public ProcessingSummary run(boolean force, boolean dryRun, UUID assetId) {
+        return run(force, dryRun, assetId, properties.isIncremental());
+    }
+
+    public ProcessingSummary run(boolean force, boolean dryRun, UUID assetId, boolean incremental) {
         log.info("正在加载受控标签词表");
         Taxonomy taxonomy = taxonomyLoader.load();
         log.info("受控标签词表加载完成 taxonomyVersion={}, allowedPaths={}",
@@ -71,12 +75,12 @@ public class PhotoProcessingService {
             log.info("进入单图处理模式 assetId={}, dryRun={}", assetId, dryRun);
             summary.scanned();
             processAssetSafely(new ImmichAsset(assetId, "IMAGE", false, false, null), taxonomy,
-                    tagIndex, force, dryRun, summary);
+                    tagIndex, force, dryRun, incremental, summary);
             return summary;
         }
 
-        log.info("开始全量扫描 pageSize={}, concurrency={}, force={}, dryRun={}",
-                properties.getPageSize(), properties.getConcurrency(), force, dryRun);
+        log.info("开始扫描 pageSize={}, concurrency={}, force={}, dryRun={}, incremental={}",
+                properties.getPageSize(), properties.getConcurrency(), force, dryRun, incremental);
         int processedSinceModelRelease = 0;
         try (ExecutorService executor = Executors.newFixedThreadPool(properties.getConcurrency(),
                 Thread.ofVirtual().name("image-analysis-", 0).factory())) {
@@ -103,7 +107,7 @@ public class PhotoProcessingService {
                 log.info("本页图片任务已准备 page={}, pending={}, skipped={}",
                         page, pendingAssets.size(), skippedOnPage);
                 processedSinceModelRelease = processInBatches(executor, pendingAssets, taxonomy, tagIndex,
-                        force, dryRun, summary, processedSinceModelRelease);
+                        force, dryRun, incremental, summary, processedSinceModelRelease);
                 log.info("本页图片处理完成 page={}, progress=[{}]", page, summary);
                 if (!assetPage.hasMore()) {
                     break;
@@ -140,24 +144,6 @@ public class PhotoProcessingService {
         log.info("已配置跳过相簿 albumIds={}, albumNames={}", skipAlbumIds, skipAlbumNames);
     }
 
-    private boolean isInSkippedAlbum(UUID assetId) {
-        if (skipAlbumIds.isEmpty() && skipAlbumNames.isEmpty()) {
-            return false;
-        }
-        List<ImmichAlbum> albums = immichClient.listAlbumsByAsset(assetId);
-        for (ImmichAlbum album : albums) {
-            boolean idMatch = skipAlbumIds.contains(album.id());
-            boolean nameMatch = album.albumName() != null
-                    && skipAlbumNames.contains(album.albumName().toLowerCase(Locale.ROOT));
-            if (idMatch || nameMatch) {
-                log.info("资产所在相簿命中跳过配置 assetId={}, album={}({})",
-                        assetId, album.albumName(), album.id());
-                return true;
-            }
-        }
-        return false;
-    }
-
     private UUID parseUuid(String value) {
         if (value == null || value.isBlank()) {
             return null;
@@ -169,45 +155,153 @@ public class PhotoProcessingService {
         }
     }
 
+    private boolean isInSkippedAlbum(List<ImmichAlbum> albums, UUID assetId, boolean logMatch) {
+        for (ImmichAlbum album : albums) {
+            boolean idMatch = skipAlbumIds.contains(album.id());
+            boolean nameMatch = album.albumName() != null
+                    && skipAlbumNames.contains(album.albumName().toLowerCase(Locale.ROOT));
+            if (idMatch || nameMatch) {
+                if (logMatch) {
+                    log.info("资产所在相簿命中跳过配置 assetId={}, album={}({})",
+                            assetId, album.albumName(), album.id());
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private AssetRead readAsset(ImmichAsset asset, boolean incremental, boolean dryRun, int taxonomyVersion) {
+        String fileModifiedAt = fileModifiedAt(asset, null);
+        ProcessingState cachedState = incremental
+                ? stateStore.findFileState(asset.id(), fileModifiedAt) : null;
+        List<ImmichAlbum> albums = List.of();
+        boolean albumsRead = false;
+        boolean albumsFromFile = false;
+
+        if (cachedState != null && hasSkippedAlbumConfiguration() && cachedState.fileMatches(fileModifiedAt)) {
+            if (cachedState.albumsRead()) {
+                albums = cachedState.albums();
+                albumsRead = true;
+                albumsFromFile = true;
+            } else {
+                albums = immichClient.listAlbumsByAsset(asset.id());
+                albumsRead = true;
+                if (!dryRun) {
+                    if (cachedState.assetDetailRead()) {
+                        AssetDetail cachedDetail = cachedState.cachedAssetDetail(asset.id(), asset.type(),
+                                asset.fileModifiedAt());
+                        stateStore.appendRead(asset.id(), fileModifiedAt, cachedDetail, albums, true,
+                                visionModelClient.modelName(), properties.getPromptVersion(), taxonomyVersion);
+                        cachedState = stateStore.findFileState(asset.id(), fileModifiedAt);
+                    } else {
+                        stateStore.appendAlbumRead(asset.id(), fileModifiedAt, albums,
+                                visionModelClient.modelName(), properties.getPromptVersion(), taxonomyVersion);
+                    }
+                }
+            }
+            if (isInSkippedAlbum(albums, asset.id(), false)) {
+                return new AssetRead(null, albums, true, false, albumsFromFile);
+            }
+            if (cachedState.assetDetailRead()) {
+                AssetDetail cachedDetail = cachedState.cachedAssetDetail(asset.id(), asset.type(),
+                        asset.fileModifiedAt());
+                log.info("复用图片读取缓存 assetId={}, tags={}, albumsRead={}",
+                        asset.id(), cachedDetail.tags().size(), albumsRead);
+                return new AssetRead(cachedDetail, albums, albumsRead, true, albumsFromFile);
+            }
+        } else if (cachedState != null && cachedState.readMatches(fileModifiedAt)) {
+            AssetDetail cachedDetail = cachedState.cachedAssetDetail(asset.id(), asset.type(), asset.fileModifiedAt());
+            log.info("复用图片读取缓存 assetId={}, tags={}, albumsRead={}",
+                    asset.id(), cachedDetail.tags().size(), cachedState.albumsRead());
+            return new AssetRead(cachedDetail, cachedState.albums(), cachedState.albumsRead(), true,
+                    cachedState.albumsRead());
+        }
+
+        if (hasSkippedAlbumConfiguration() && !albumsRead) {
+            albums = immichClient.listAlbumsByAsset(asset.id());
+            albumsRead = true;
+            if (isInSkippedAlbum(albums, asset.id(), false)) {
+                if (!dryRun) {
+                    stateStore.appendAlbumRead(asset.id(), fileModifiedAt, albums,
+                            visionModelClient.modelName(), properties.getPromptVersion(), taxonomyVersion);
+                }
+                return new AssetRead(null, albums, true, false, false);
+            }
+        }
+
+        log.info("正在读取图片详情 assetId={}", asset.id());
+        AssetDetail detail = immichClient.getAsset(asset.id());
+        if (!dryRun) {
+            stateStore.appendRead(asset.id(), fileModifiedAt(asset, detail), detail, albums, albumsRead,
+                    visionModelClient.modelName(), properties.getPromptVersion(), taxonomyVersion);
+        }
+        return new AssetRead(detail, albums, albumsRead, false, albumsFromFile);
+    }
+
+    private boolean hasSkippedAlbumConfiguration() {
+        return !skipAlbumIds.isEmpty() || !skipAlbumNames.isEmpty();
+    }
+
     private void processAssetSafely(ImmichAsset asset, Taxonomy taxonomy, TagIndex tagIndex,
-                                    boolean force, boolean dryRun, ProcessingSummary summary) {
+                                    boolean force, boolean dryRun, boolean incremental,
+                                    ProcessingSummary summary) {
         long assetStartedAt = System.nanoTime();
-        log.info("开始处理图片，{}", assetPageUrl(asset.id()));
+        AssetDetail detail = null;
+        List<ImmichAlbum> albums = List.of();
+        boolean albumsRead = false;
         try {
-            if (isInSkippedAlbum(asset.id())) {
+            if (incremental && !force && stateStore.isSuccessfullyProcessed(asset.id())) {
                 summary.skipped();
-                log.info("图片属于跳过相簿，跳过处理 assetId={}", asset.id());
                 return;
             }
-            if (!force && stateStore.isSuccessfullyProcessed(asset.id())) {
+            AssetRead read = readAsset(asset, incremental, dryRun, taxonomy.version());
+            detail = read.detail();
+            albums = read.albums();
+            albumsRead = read.albumsRead();
+            if (albumsRead && isInSkippedAlbum(albums, asset.id(), !read.albumsFromFile())) {
                 summary.skipped();
-                log.info("图片已设置过标签，按历史记录跳过处理 assetId={}", asset.id());
+                if (!read.albumsFromFile()) {
+                    log.info("图片属于跳过相簿，跳过处理 assetId={}", asset.id());
+                }
                 return;
             }
-            log.info("正在读取图片详情 assetId={}", asset.id());
-            AssetDetail detail = immichClient.getAsset(asset.id());
+            if (detail == null) {
+                throw new IllegalStateException("未读取到图片详情");
+            }
             if (!detail.isImage()) {
                 summary.skipped();
-                log.info("非图片资产，跳过处理 assetId={}, type={}", asset.id(), detail.type());
+                if (!read.detailFromFile()) {
+                    log.info("非图片资产，跳过处理 assetId={}, type={}", asset.id(), detail.type());
+                }
                 return;
             }
             if (!detail.tags().isEmpty()) {
                 summary.skipped();
-                log.info("图片已存在标签，跳过模型调用 assetId={}, tagCount={}", asset.id(), detail.tags().size());
+                if (!read.detailFromFile()) {
+                    log.info("图片已存在标签，跳过模型调用 assetId={}, tagCount={}",
+                            asset.id(), detail.tags().size());
+                }
                 return;
             }
-            processOne(asset, taxonomy, tagIndex, dryRun, summary);
+            log.info("开始处理图片，{}", assetPageUrl(asset.id()));
+            processOne(asset, taxonomy, tagIndex, albums, albumsRead, dryRun, summary);
             log.info("图片处理流程结束 assetId={}, elapsedMs={}", asset.id(), elapsedMillis(assetStartedAt));
         } catch (Exception e) {
             summary.failed();
             String errorCode = errorCode(e);
-            recordFailure(asset, taxonomy, errorCode, dryRun);
+            recordFailure(asset, taxonomy, errorCode, dryRun, detail, albums, albumsRead);
             log.error("处理图片失败 assetId={}, errorCode={}, reason={}, elapsedMs={}",
                     asset.id(), errorCode, failureReason(e), elapsedMillis(assetStartedAt));
         }
     }
 
+    private record AssetRead(AssetDetail detail, List<ImmichAlbum> albums, boolean albumsRead,
+                             boolean detailFromFile, boolean albumsFromFile) {
+    }
+
     private void processOne(ImmichAsset asset, Taxonomy taxonomy, TagIndex tagIndex,
+                            List<ImmichAlbum> albums, boolean albumsRead,
                             boolean dryRun, ProcessingSummary summary) {
         long previewStartedAt = System.nanoTime();
         log.info("正在下载图片预览图 assetId={}", asset.id());
@@ -264,7 +358,7 @@ public class PhotoProcessingService {
         }
 
         stateStore.appendSuccess(asset.id(), fileModifiedAt(asset, latestDetail), visionModelClient.modelName(),
-                properties.getPromptVersion(), taxonomy.version());
+                properties.getPromptVersion(), taxonomy.version(), latestDetail, albums, albumsRead);
         if (newTagPaths.stream().anyMatch(e -> !e.startsWith("风光") && !e.startsWith("人像"))) {
             log.info("asset id:{}", asset.id());
         }
@@ -437,10 +531,11 @@ public class PhotoProcessingService {
                 .toList();
     }
 
-    private void recordFailure(ImmichAsset asset, Taxonomy taxonomy, String errorCode, boolean dryRun) {
+    private void recordFailure(ImmichAsset asset, Taxonomy taxonomy, String errorCode, boolean dryRun,
+                               AssetDetail detail, List<ImmichAlbum> albums, boolean albumsRead) {
         if (!dryRun) {
-            stateStore.appendFailure(asset.id(), fileModifiedAt(asset, null), visionModelClient.modelName(),
-                    properties.getPromptVersion(), taxonomy.version(), errorCode);
+            stateStore.appendFailure(asset.id(), fileModifiedAt(asset, detail), visionModelClient.modelName(),
+                    properties.getPromptVersion(), taxonomy.version(), errorCode, detail, albums, albumsRead);
         }
     }
 
@@ -504,15 +599,16 @@ public class PhotoProcessingService {
     }
 
     private int processInBatches(ExecutorService executor, List<ImmichAsset> assets, Taxonomy taxonomy,
-                                 TagIndex tagIndex, boolean force, boolean dryRun, ProcessingSummary summary,
-                                 int processedSinceModelRelease) {
+                                 TagIndex tagIndex, boolean force, boolean dryRun, boolean incremental,
+                                 ProcessingSummary summary, int processedSinceModelRelease) {
         int start = 0;
         while (start < assets.size()) {
             int remainingBeforeRelease = properties.getModelReleaseInterval() - processedSinceModelRelease;
             int end = Math.min(start + remainingBeforeRelease, assets.size());
             List<Future<?>> futures = new ArrayList<>(end - start);
             for (ImmichAsset asset : assets.subList(start, end)) {
-                futures.add(executor.submit(() -> processAssetSafely(asset, taxonomy, tagIndex, force, dryRun, summary)));
+                futures.add(executor.submit(() -> processAssetSafely(asset, taxonomy, tagIndex, force, dryRun,
+                        incremental, summary)));
             }
             awaitCompletion(futures);
             processedSinceModelRelease += end - start;
